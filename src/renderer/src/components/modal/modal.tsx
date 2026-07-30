@@ -2,17 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { XIcon } from "@primer/octicons-react";
 
-import * as styles from "./modal.css";
+import "./modal.scss";
 
 import { Backdrop } from "../backdrop/backdrop";
 import { useTranslation } from "react-i18next";
+import cn from "classnames";
 
 export interface ModalProps {
   visible: boolean;
-  title: string;
+  title: React.ReactNode;
   description?: string;
   onClose: () => void;
   large?: boolean;
+  noContentPadding?: boolean;
   children: React.ReactNode;
   clickOutsideToClose?: boolean;
 }
@@ -23,6 +25,7 @@ export function Modal({
   description,
   onClose,
   large,
+  noContentPadding,
   children,
   clickOutsideToClose = true,
 }: ModalProps) {
@@ -46,6 +49,13 @@ export function Modal({
   }, [onClose]);
 
   const isTopMostModal = () => {
+    if (
+      document.querySelector(
+        ".featurebase-widget-overlay.featurebase-display-block"
+      )
+    )
+      return false;
+
     const openModals = document.querySelectorAll("[role=dialog]");
 
     return (
@@ -74,8 +84,17 @@ export function Modal({
 
   useEffect(() => {
     if (clickOutsideToClose) {
-      const onMouseDown = (e: MouseEvent) => {
+      const onPointerDown = (e: PointerEvent) => {
         if (!isTopMostModal()) return;
+        const target = e.target as Element | null;
+
+        const hasOpenDropdownMenu =
+          document.querySelector(".dropdown-menu__content") !== null;
+
+        if (hasOpenDropdownMenu && !modalContentRef.current?.contains(target)) {
+          return;
+        }
+
         if (modalContentRef.current) {
           const clickedWithinModal = modalContentRef.current.contains(
             e.target as Node
@@ -87,10 +106,10 @@ export function Modal({
         }
       };
 
-      window.addEventListener("mousedown", onMouseDown);
+      window.addEventListener("pointerdown", onPointerDown, true);
 
       return () => {
-        window.removeEventListener("mousedown", onMouseDown);
+        window.removeEventListener("pointerdown", onPointerDown, true);
       };
     }
 
@@ -102,14 +121,17 @@ export function Modal({
   return createPortal(
     <Backdrop isClosing={isClosing}>
       <div
-        className={styles.modal({ closing: isClosing, large })}
+        className={cn("modal", {
+          "modal--closing": isClosing,
+          "modal--large": large,
+        })}
         role="dialog"
-        aria-labelledby={title}
         aria-describedby={description}
         ref={modalContentRef}
+        data-hydra-dialog
       >
-        <div className={styles.modalHeader}>
-          <div style={{ display: "flex", gap: 4, flexDirection: "column" }}>
+        <div className="modal__header">
+          <div className="modal__header-title">
             <h3>{title}</h3>
             {description && <p>{description}</p>}
           </div>
@@ -117,13 +139,19 @@ export function Modal({
           <button
             type="button"
             onClick={handleCloseClick}
-            className={styles.closeModalButton}
+            className="modal__close-button"
             aria-label={t("close")}
           >
-            <XIcon className={styles.closeModalButtonIcon} size={24} />
+            <XIcon className="modal__close-button-icon" size={24} />
           </button>
         </div>
-        <div className={styles.modalContent}>{children}</div>
+        <div
+          className={cn("modal__content", {
+            "modal__content--no-padding": noContentPadding,
+          })}
+        >
+          {children}
+        </div>
       </div>
     </Backdrop>,
     document.body

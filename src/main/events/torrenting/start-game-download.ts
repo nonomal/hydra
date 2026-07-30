@@ -1,106 +1,101 @@
-import {
-  downloadQueueRepository,
-  gameRepository,
-  repackRepository,
-} from "@main/repository";
-
 import { registerEvent } from "../register-event";
-
-import type { StartGameDownloadPayload } from "@types";
-import { getFileBase64, getSteamAppAsset } from "@main/helpers";
-import { DownloadManager } from "@main/services";
-
-import { Not } from "typeorm";
-import { steamGamesWorker } from "@main/workers";
+import type { Download, StartGameDownloadPayload } from "@types";
+import {
+  DownloadManager,
+  DownloadOrchestrator,
+  HydraApi,
+  logger,
+} from "@main/services";
 import { createGame } from "@main/services/library-sync";
+import { downloadsSublevel, gamesSublevel, levelKeys } from "@main/level";
+import {
+  getGlobalTrackers,
+  handleDownloadError,
+  isKnownDownloadError,
+  prepareGameEntry,
+} from "@main/helpers";
 
 const startGameDownload = async (
   _event: Electron.IpcMainInvokeEvent,
   payload: StartGameDownloadPayload
 ) => {
-  const { repackId, objectID, title, shop, downloadPath, downloader } = payload;
+  const {
+    objectId,
+    title,
+    shop,
+    downloadPath,
+    downloader,
+    uri,
+    automaticallyExtract,
+    automaticallyDeleteArchiveFiles,
+    fileIndices,
+    selectedFilesSize,
+  } = payload;
 
-  const [game, repack] = await Promise.all([
-    gameRepository.findOne({
-      where: {
-        objectID,
-        shop,
-      },
-    }),
-    repackRepository.findOne({
-      where: {
-        id: repackId,
-      },
-    }),
-  ]);
+  const gameKey = levelKeys.game(shop, objectId);
 
-  if (!repack) return;
-
-  await DownloadManager.pauseDownload();
-
-  await gameRepository.update(
-    { status: "active", progress: Not(1) },
-    { status: "paused" }
+  logger.log(
+    `[Downloads] Start requested for ${gameKey} (downloader=${downloader})`
   );
 
-  if (game) {
-    await gameRepository.update(
-      {
-        id: game.id,
-      },
-      {
-        status: "active",
-        progress: 0,
-        bytesDownloaded: 0,
-        downloadPath,
-        downloader,
-        uri: repack.magnet,
-        isDeleted: false,
-      }
-    );
-  } else {
-    const steamGame = await steamGamesWorker.run(Number(objectID), {
-      name: "getById",
-    });
+  let didWriteDownload = false;
 
-    const iconUrl = steamGame?.clientIcon
-      ? getSteamAppAsset("icon", objectID, steamGame.clientIcon)
-      : null;
+  try {
+    const globalTrackers = await getGlobalTrackers();
 
-    await gameRepository
-      .insert({
-        title,
-        iconUrl,
-        objectID,
-        downloader,
-        shop,
-        status: "active",
-        downloadPath,
-        uri: repack.magnet,
-      })
-      .then((result) => {
-        if (iconUrl) {
-          getFileBase64(iconUrl).then((base64) =>
-            gameRepository.update({ objectID }, { iconUrl: base64 })
-          );
-        }
+    const download: Download = {
+      shop,
+      objectId,
+      status: "paused",
+      progress: 0,
+      bytesDownloaded: 0,
+      downloadPath,
+      downloader,
+      uri,
+      folderName: null,
+      shouldSeed: false,
+      timestamp: Date.now(),
+      queued: true,
+      pinnedToHero: false,
+      extracting: false,
+      automaticallyExtract,
+      automaticallyDeleteArchiveFiles,
+      fileIndices,
+      selectedFilesSize,
+      fileSize: selectedFilesSize ?? null,
+      customTrackers: globalTrackers,
+    };
+    await DownloadManager.validateDownloadUrl(download);
+    await prepareGameEntry({ gameKey, title, objectId, shop });
+    await DownloadManager.cancelDownload(gameKey).catch(() => null);
+    await downloadsSublevel.put(gameKey, download);
+    didWriteDownload = true;
+    await DownloadOrchestrator.startPreparedDownload(download);
 
-        return result;
-      });
+    const updatedGame = await gamesSublevel.get(gameKey);
+
+    await Promise.all([
+      createGame(updatedGame!).catch(() => {}),
+      HydraApi.post(`/games/${shop}/${objectId}/download`, null, {
+        needsAuth: false,
+      }).catch(() => {}),
+    ]);
+
+    return { ok: true };
+  } catch (err: unknown) {
+    if (didWriteDownload) {
+      await DownloadManager.cancelDownload(gameKey).catch(() => null);
+      await downloadsSublevel.del(gameKey).catch(() => null);
+      await DownloadOrchestrator.syncAfterDownloadRemoved({ shop, objectId });
+    }
+
+    if (isKnownDownloadError(err)) {
+      logger.warn("Failed to start download with expected download error", err);
+    } else {
+      logger.error("Failed to start download", err);
+    }
+    return handleDownloadError(err, downloader);
   }
-
-  const updatedGame = await gameRepository.findOne({
-    where: {
-      objectID,
-    },
-  });
-
-  createGame(updatedGame!);
-
-  await downloadQueueRepository.delete({ game: { id: updatedGame!.id } });
-  await downloadQueueRepository.insert({ game: { id: updatedGame!.id } });
-
-  await DownloadManager.startDownload(updatedGame!);
 };
 
 registerEvent("startGameDownload", startGameDownload);

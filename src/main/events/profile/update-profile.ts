@@ -1,59 +1,89 @@
 import { registerEvent } from "../register-event";
-import { HydraApi } from "@main/services";
-import axios from "axios";
+import { HydraApi, WindowManager } from "@main/services";
 import fs from "node:fs";
 import path from "node:path";
+import type { UpdateProfileRequest, UserProfile } from "@types";
+import { omit } from "lodash-es";
+import axios from "axios";
 import { fileTypeFromFile } from "file-type";
-import { UserProfile } from "@types";
 
-const patchUserProfile = async (
-  displayName: string,
-  profileImageUrl?: string
+export const patchUserProfile = async (updateProfile: UpdateProfileRequest) => {
+  return HydraApi.patch<UserProfile>("/profile", updateProfile);
+};
+
+const uploadImage = async (
+  type: "profile-image" | "background-image",
+  imagePath: string
 ) => {
-  if (profileImageUrl) {
-    return HydraApi.patch("/profile", {
-      displayName,
-      profileImageUrl,
-    });
-  } else {
-    return HydraApi.patch("/profile", {
-      displayName,
-    });
+  const stat = fs.statSync(imagePath);
+  const fileBuffer = fs.readFileSync(imagePath);
+  const fileSizeInBytes = stat.size;
+
+  const response = await HydraApi.post<{ presignedUrl: string }>(
+    `/presigned-urls/${type}`,
+    {
+      imageExt: path.extname(imagePath).slice(1),
+      imageLength: fileSizeInBytes,
+    }
+  );
+
+  const mimeType = await fileTypeFromFile(imagePath);
+
+  await axios.put(response.presignedUrl, fileBuffer, {
+    headers: {
+      "Content-Type": mimeType?.mime,
+    },
+  });
+
+  if (type === "background-image") {
+    return response["backgroundImageUrl"];
   }
+
+  return response["profileImageUrl"];
 };
 
 const updateProfile = async (
   _event: Electron.IpcMainInvokeEvent,
-  displayName: string,
-  newProfileImagePath: string | null
-): Promise<UserProfile> => {
-  if (!newProfileImagePath) {
-    return patchUserProfile(displayName);
+  updateProfile: UpdateProfileRequest
+) => {
+  const payload = omit(updateProfile, [
+    "profileImageUrl",
+    "backgroundImageUrl",
+  ]);
+
+  if (updateProfile.profileImageUrl !== undefined) {
+    if (updateProfile.profileImageUrl === null) {
+      payload["profileImageUrl"] = null;
+    } else {
+      const profileImageUrl = await uploadImage(
+        "profile-image",
+        updateProfile.profileImageUrl
+      ).catch(() => undefined);
+
+      payload["profileImageUrl"] = profileImageUrl;
+    }
   }
 
-  const stats = fs.statSync(newProfileImagePath);
-  const fileBuffer = fs.readFileSync(newProfileImagePath);
-  const fileSizeInBytes = stats.size;
+  if (updateProfile.backgroundImageUrl !== undefined) {
+    if (updateProfile.backgroundImageUrl === null) {
+      payload["backgroundImageUrl"] = null;
+    } else {
+      const backgroundImageUrl = await uploadImage(
+        "background-image",
+        updateProfile.backgroundImageUrl
+      ).catch(() => undefined);
 
-  const profileImageUrl = await HydraApi.post(`/presigned-urls/profile-image`, {
-    imageExt: path.extname(newProfileImagePath).slice(1),
-    imageLength: fileSizeInBytes,
-  })
-    .then(async (preSignedResponse) => {
-      const { presignedUrl, profileImageUrl } = preSignedResponse;
+      payload["backgroundImageUrl"] = backgroundImageUrl;
+    }
+  }
 
-      const mimeType = await fileTypeFromFile(newProfileImagePath);
+  const updatedProfile = await patchUserProfile(payload);
 
-      await axios.put(presignedUrl, fileBuffer, {
-        headers: {
-          "Content-Type": mimeType?.mime,
-        },
-      });
-      return profileImageUrl as string;
-    })
-    .catch(() => undefined);
+  // Notify every window (e.g. the friends window, which has its own store) so
+  // they can re-fetch the signed-in user's details after a profile change.
+  WindowManager.sendToAppWindows("on-profile-updated");
 
-  return patchUserProfile(displayName, profileImageUrl);
+  return updatedProfile;
 };
 
 registerEvent("updateProfile", updateProfile);

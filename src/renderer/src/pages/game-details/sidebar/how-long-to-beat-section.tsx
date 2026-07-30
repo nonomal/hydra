@@ -1,9 +1,8 @@
 import Skeleton, { SkeletonTheme } from "react-loading-skeleton";
 import { useTranslation } from "react-i18next";
 import type { HowLongToBeatCategory } from "@types";
-import { vars } from "@renderer/theme.css";
-
-import * as styles from "./sidebar.css";
+import { SidebarSection } from "../sidebar-section/sidebar-section";
+import "./sidebar.scss";
 
 const durationTranslation: Record<string, string> = {
   Hours: "hours",
@@ -26,45 +25,39 @@ export function HowLongToBeatSection({
     return `${value} ${t(durationTranslation[unit])}`;
   };
 
-  if (!howLongToBeatData && !isLoading) return null;
+  if ((!howLongToBeatData || howLongToBeatData.length === 0) && !isLoading)
+    return null;
 
   return (
-    <SkeletonTheme baseColor={vars.color.background} highlightColor="#444">
-      <div className={styles.contentSidebarTitle}>
-        <h3>HowLongToBeat</h3>
-      </div>
+    <SkeletonTheme baseColor="#1c1c1c" highlightColor="#444">
+      <SidebarSection title="HowLongToBeat">
+        <ul className="how-long-to-beat__categories-list">
+          {howLongToBeatData
+            ? howLongToBeatData.map((category) => (
+                <li key={category.title} className="how-long-to-beat__category">
+                  <p className="how-long-to-beat__category-label how-long-to-beat__category-label--bold">
+                    {category.title}
+                  </p>
 
-      <ul className={styles.howLongToBeatCategoriesList}>
-        {howLongToBeatData
-          ? howLongToBeatData.map((category) => (
-              <li key={category.title} className={styles.howLongToBeatCategory}>
-                <p
-                  className={styles.howLongToBeatCategoryLabel}
-                  style={{
-                    fontWeight: "bold",
-                  }}
-                >
-                  {category.title}
-                </p>
+                  <p className="how-long-to-beat__category-label">
+                    {getDuration(category.duration)}
+                  </p>
 
-                <p className={styles.howLongToBeatCategoryLabel}>
-                  {getDuration(category.duration)}
-                </p>
-
-                {category.accuracy !== "00" && (
-                  <small>
-                    {t("accuracy", { accuracy: category.accuracy })}
-                  </small>
-                )}
-              </li>
-            ))
-          : Array.from({ length: 4 }).map((_, index) => (
-              <Skeleton
-                key={index}
-                className={styles.howLongToBeatCategorySkeleton}
-              />
-            ))}
-      </ul>
+                  {category.accuracy !== "00" && (
+                    <small>
+                      {t("accuracy", { accuracy: category.accuracy })}
+                    </small>
+                  )}
+                </li>
+              ))
+            : Array.from({ length: 4 }).map((_, index) => (
+                <Skeleton
+                  key={index}
+                  className="how-long-to-beat__category-skeleton"
+                />
+              ))}
+        </ul>
+      </SidebarSection>
     </SkeletonTheme>
   );
 }

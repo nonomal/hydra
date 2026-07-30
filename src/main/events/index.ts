@@ -1,62 +1,35 @@
-import { defaultDownloadsPath } from "@main/constants";
-import { app, ipcMain } from "electron";
+import { appVersion, defaultDownloadsPath, isStaging } from "@main/constants";
+import { ipcMain } from "electron";
 
-import "./catalogue/get-catalogue";
-import "./catalogue/get-game-shop-details";
-import "./catalogue/get-games";
-import "./catalogue/get-how-long-to-beat";
-import "./catalogue/get-random-game";
-import "./catalogue/search-games";
-import "./catalogue/search-game-repacks";
-import "./hardware/get-disk-free-space";
-import "./library/add-game-to-library";
-import "./library/create-game-shortcut";
-import "./library/close-game";
-import "./library/delete-game-folder";
-import "./library/get-game-by-object-id";
-import "./library/get-library";
-import "./library/open-game";
-import "./library/open-game-executable-path";
-import "./library/open-game-installer";
-import "./library/open-game-installer-path";
-import "./library/update-executable-path";
-import "./library/remove-game";
-import "./library/remove-game-from-library";
-import "./misc/open-external";
-import "./misc/show-open-dialog";
-import "./torrenting/cancel-game-download";
-import "./torrenting/pause-game-download";
-import "./torrenting/resume-game-download";
-import "./torrenting/start-game-download";
-import "./user-preferences/get-user-preferences";
-import "./user-preferences/update-user-preferences";
-import "./user-preferences/auto-launch";
-import "./autoupdater/check-for-updates";
-import "./autoupdater/restart-and-install-update";
-import "./user-preferences/authenticate-real-debrid";
-import "./download-sources/get-download-sources";
-import "./download-sources/validate-download-source";
-import "./download-sources/add-download-source";
-import "./download-sources/remove-download-source";
-import "./download-sources/sync-download-sources";
-import "./auth/sign-out";
-import "./auth/open-auth-window";
-import "./auth/get-session-hash";
-import "./user/get-user";
-import "./user/block-user";
-import "./user/unblock-user";
-import "./user/get-user-friends";
-import "./profile/get-friend-requests";
-import "./profile/get-me";
-import "./profile/undo-friendship";
-import "./profile/update-friend-request";
-import "./profile/update-profile";
-import "./profile/send-friend-request";
+import "./auth";
+import "./autoupdater";
+import "./big-picture";
+import "./catalogue";
+import "./cloud-save";
+import "./connectivity";
+import "./download-sources";
+import "./friends";
+import "./hardware";
+import "./library";
+import "./leveldb";
+import "./main-window-controls";
+import "./misc";
+import "./notifications";
+import "./profile";
+import "./themes";
+import "./torrenting";
+import "./user";
+import "./user-preferences";
+import "./library/transfer-game-files";
+import "./emulators";
+
+import { isPortableVersion } from "@main/helpers";
 
 ipcMain.handle("ping", () => "pong");
-ipcMain.handle("getVersion", () => app.getVersion());
-ipcMain.handle(
-  "isPortableVersion",
-  () => process.env.PORTABLE_EXECUTABLE_FILE != null
-);
+ipcMain.handle("getVersion", () => appVersion);
+ipcMain.handle("isStaging", () => isStaging);
+ipcMain.handle("isPortableVersion", () => isPortableVersion());
 ipcMain.handle("getDefaultDownloadsPath", () => defaultDownloadsPath);
+ipcMain.handle("getCloudIframeUrl", () =>
+  new URL("/cloud", import.meta.env.MAIN_VITE_CHECKOUT_URL).toString()
+);

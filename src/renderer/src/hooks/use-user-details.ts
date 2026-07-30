@@ -1,150 +1,167 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { useAppDispatch, useAppSelector } from "./redux";
 import {
   setProfileBackground,
   setUserDetails,
   setFriendRequests,
-  setFriendsModalVisible,
-  setFriendsModalHidden,
+  clearCollections,
 } from "@renderer/features";
-import { profileBackgroundFromProfileImage } from "@renderer/helpers";
-import { FriendRequestAction, UserDetails } from "@types";
-import { UserFriendModalTab } from "@renderer/pages/shared-modals/user-friend-modal";
+import type {
+  FriendRequestAction,
+  UpdateProfileRequest,
+  UserDetails,
+  FriendRequest,
+} from "@types";
 
 export function useUserDetails() {
   const dispatch = useAppDispatch();
 
-  const {
-    userDetails,
-    profileBackground,
-    friendRequests,
-    isFriendsModalVisible,
-    friendModalUserId,
-    friendRequetsModalTab,
-  } = useAppSelector((state) => state.userDetails);
+  const { userDetails, profileBackground, friendRequests, friendRequestCount } =
+    useAppSelector((state) => state.userDetails);
 
   const clearUserDetails = useCallback(async () => {
     dispatch(setUserDetails(null));
     dispatch(setProfileBackground(null));
+    dispatch(clearCollections());
 
-    window.localStorage.removeItem("userDetails");
+    globalThis.window.localStorage.removeItem("userDetails");
+    window["userDetails"] = null;
   }, [dispatch]);
 
   const signOut = useCallback(async () => {
     clearUserDetails();
 
-    return window.electron.signOut();
+    return globalThis.window.electron.signOut();
   }, [clearUserDetails]);
 
   const updateUserDetails = useCallback(
     async (userDetails: UserDetails) => {
       dispatch(setUserDetails(userDetails));
-
-      if (userDetails.profileImageUrl) {
-        const profileBackground = await profileBackgroundFromProfileImage(
-          userDetails.profileImageUrl
-        );
-        dispatch(setProfileBackground(profileBackground));
-
-        window.localStorage.setItem(
-          "userDetails",
-          JSON.stringify({ ...userDetails, profileBackground })
-        );
-      } else {
-        const profileBackground = `#151515B3`;
-        dispatch(setProfileBackground(profileBackground));
-
-        window.localStorage.setItem(
-          "userDetails",
-          JSON.stringify({ ...userDetails, profileBackground })
-        );
-      }
+      globalThis.window.localStorage.setItem(
+        "userDetails",
+        JSON.stringify(userDetails)
+      );
     },
     [dispatch]
   );
 
   const fetchUserDetails = useCallback(async () => {
-    return window.electron.getMe().then((userDetails) => {
+    return globalThis.window.electron.getMe().then((userDetails) => {
       if (userDetails == null) {
         clearUserDetails();
       }
+
+      window["userDetails"] = userDetails;
 
       return userDetails;
     });
   }, [clearUserDetails]);
 
   const patchUser = useCallback(
-    async (displayName: string, imageProfileUrl: string | null) => {
-      const response = await window.electron.updateProfile(
-        displayName,
-        imageProfileUrl
-      );
-
-      return updateUserDetails(response);
+    async (values: UpdateProfileRequest) => {
+      const response = await globalThis.window.electron.updateProfile(values);
+      return updateUserDetails({
+        ...response,
+        username: userDetails?.username || "",
+        subscription: userDetails?.subscription || null,
+        workwondersJwt: userDetails?.workwondersJwt || "",
+        karma: userDetails?.karma || 0,
+      });
     },
-    [updateUserDetails]
+    [
+      updateUserDetails,
+      userDetails?.username,
+      userDetails?.subscription,
+      userDetails?.workwondersJwt,
+      userDetails?.karma,
+    ]
   );
 
-  const fetchFriendRequests = useCallback(() => {
-    return window.electron
-      .getFriendRequests()
+  const fetchFriendRequests = useCallback(async () => {
+    return globalThis.window.electron.hydraApi
+      .get<FriendRequest[]>("/profile/friend-requests")
       .then((friendRequests) => {
         dispatch(setFriendRequests(friendRequests));
+        return friendRequests;
       })
-      .catch(() => {});
+      .catch(() => null);
   }, [dispatch]);
 
-  const showFriendsModal = useCallback(
-    (initialTab: UserFriendModalTab, userId: string) => {
-      dispatch(setFriendsModalVisible({ initialTab, userId }));
-      fetchFriendRequests();
+  // After a local accept/refuse/cancel/send, the API has already mutated the
+  // request server-side but only the *other* user gets a WS push. Fan the new
+  // state out to every app window (main, big picture, friends) so their request
+  // badges and notification lists refresh without a manual reload.
+  const broadcastFriendRequestSync = useCallback(
+    (requests: FriendRequest[] | null) => {
+      if (!requests) return;
+
+      const receivedCount = requests.filter(
+        (request) => request.type === "RECEIVED"
+      ).length;
+
+      const { syncFriendRequests } = globalThis.window.electron;
+      if (typeof syncFriendRequests !== "function") return;
+
+      syncFriendRequests(receivedCount).catch(() => {});
     },
-    [dispatch]
+    []
   );
-
-  const hideFriendsModal = useCallback(() => {
-    dispatch(setFriendsModalHidden());
-  }, [dispatch]);
 
   const sendFriendRequest = useCallback(
     async (userId: string) => {
-      return window.electron
-        .sendFriendRequest(userId)
-        .then(() => fetchFriendRequests());
+      return globalThis.window.electron.hydraApi
+        .post("/profile/friend-requests", {
+          data: { friendCode: userId },
+        })
+        .then(() => fetchFriendRequests())
+        .then(broadcastFriendRequestSync);
     },
-    [fetchFriendRequests]
+    [fetchFriendRequests, broadcastFriendRequestSync]
   );
 
   const updateFriendRequestState = useCallback(
     async (userId: string, action: FriendRequestAction) => {
-      return window.electron
-        .updateFriendRequest(userId, action)
-        .then(() => fetchFriendRequests());
+      if (action === "CANCEL") {
+        return globalThis.window.electron.hydraApi
+          .delete(`/profile/friend-requests/${userId}`)
+          .then(() => fetchFriendRequests())
+          .then(broadcastFriendRequestSync);
+      }
+
+      return globalThis.window.electron.hydraApi
+        .patch(`/profile/friend-requests/${userId}`, {
+          data: {
+            requestState: action,
+          },
+        })
+        .then(() => fetchFriendRequests())
+        .then(broadcastFriendRequestSync);
     },
-    [fetchFriendRequests]
+    [fetchFriendRequests, broadcastFriendRequestSync]
   );
 
-  const undoFriendship = (userId: string) => {
-    return window.electron.undoFriendship(userId);
-  };
+  const undoFriendship = (userId: string) =>
+    globalThis.window.electron.hydraApi.delete(
+      `/profile/friend-requests/${userId}`
+    );
 
-  const blockUser = (userId: string) => {
-    return window.electron.blockUser(userId);
-  };
+  const blockUser = (userId: string) =>
+    globalThis.window.electron.hydraApi.post(`/users/${userId}/block`);
 
-  const unblockUser = (userId: string) => {
-    return window.electron.unblockUser(userId);
-  };
+  const unblockUser = (userId: string) =>
+    globalThis.window.electron.hydraApi.post(`/users/${userId}/unblock`);
+
+  const hasActiveSubscription = useMemo(() => {
+    const expiresAt = new Date(userDetails?.subscription?.expiresAt ?? 0);
+    return expiresAt > new Date();
+  }, [userDetails]);
 
   return {
     userDetails,
     profileBackground,
     friendRequests,
-    friendRequetsModalTab,
-    isFriendsModalVisible,
-    friendModalUserId,
-    showFriendsModal,
-    hideFriendsModal,
+    friendRequestCount,
+    hasActiveSubscription,
     fetchUserDetails,
     signOut,
     clearUserDetails,

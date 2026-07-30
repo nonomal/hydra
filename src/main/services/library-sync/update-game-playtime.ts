@@ -1,13 +1,17 @@
-import { Game } from "@main/entity";
+import type { Game } from "@types";
 import { HydraApi } from "../hydra-api";
 
-export const updateGamePlaytime = async (
+export const trackGamePlaytime = async (
   game: Game,
   deltaInMillis: number,
   lastTimePlayed: Date
 ) => {
-  HydraApi.put(`/games/${game.remoteId}`, {
+  if (game.shop === "custom") {
+    return;
+  }
+
+  return HydraApi.put(`/profile/games/${game.shop}/${game.objectId}`, {
     playTimeDeltaInSeconds: Math.trunc(deltaInMillis / 1000),
     lastTimePlayed,
-  }).catch(() => {});
+  });
 };

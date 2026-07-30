@@ -1,19 +1,15 @@
-import { gameRepository } from "@main/repository";
-
 import { registerEvent } from "../register-event";
-import { shell } from "electron";
-import { parseExecutablePath } from "../helpers/parse-executable-path";
+import { GameShop } from "@types";
+import { launchGame } from "@main/helpers";
 
 const openGame = async (
   _event: Electron.IpcMainInvokeEvent,
-  gameId: number,
-  executablePath: string
+  shop: GameShop,
+  objectId: string,
+  executablePath: string,
+  launchOptions?: string | null
 ) => {
-  const parsedPath = parseExecutablePath(executablePath);
-
-  await gameRepository.update({ id: gameId }, { executablePath: parsedPath });
-
-  shell.openPath(parsedPath);
+  await launchGame({ shop, objectId, executablePath, launchOptions });
 };
 
 registerEvent("openGame", openGame);

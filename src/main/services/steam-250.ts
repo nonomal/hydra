@@ -10,14 +10,14 @@ export const requestSteam250 = async (path: string) => {
       const { window } = new JSDOM(response.data);
       const { document } = window;
 
-      return Array.from(document.querySelectorAll(".appline .title a"))
+      return Array.from(document.querySelectorAll("a[data-title]"))
         .map(($title) => {
           const steamGameUrl = ($title as HTMLAnchorElement).href;
           if (!steamGameUrl) return null;
 
           return {
-            title: $title.textContent,
-            objectID: steamGameUrl.split("/").pop(),
+            title: $title.getAttribute("data-title") || "",
+            objectId: steamGameUrl.split("/").pop(),
           } as Steam250Game;
         })
         .filter((game) => game != null);
@@ -38,7 +38,7 @@ export const getSteam250List = async () => {
   ).flat();
 
   const gamesMap: Map<string, Steam250Game> = gamesList.reduce((map, item) => {
-    if (item) map.set(item.objectID, item);
+    if (item) map.set(item.objectId, item);
 
     return map;
   }, new Map());

@@ -1,13 +1,27 @@
-import { downloadSourceRepository } from "@main/repository";
+import { HydraApi } from "@main/services";
+import { downloadSourcesSublevel } from "@main/level";
 import { registerEvent } from "../register-event";
-import { RepacksManager } from "@main/services";
 
 const removeDownloadSource = async (
   _event: Electron.IpcMainInvokeEvent,
-  id: number
+  removeAll = false,
+  downloadSourceId?: string
 ) => {
-  await downloadSourceRepository.delete(id);
-  await RepacksManager.updateRepacks();
+  const params = new URLSearchParams({
+    all: removeAll.toString(),
+  });
+
+  if (downloadSourceId) params.set("downloadSourceId", downloadSourceId);
+
+  if (HydraApi.isLoggedIn() && HydraApi.hasActiveSubscription()) {
+    void HydraApi.delete(`/profile/download-sources?${params.toString()}`);
+  }
+
+  if (removeAll) {
+    await downloadSourcesSublevel.clear();
+  } else if (downloadSourceId) {
+    await downloadSourcesSublevel.del(downloadSourceId);
+  }
 };
 
 registerEvent("removeDownloadSource", removeDownloadSource);

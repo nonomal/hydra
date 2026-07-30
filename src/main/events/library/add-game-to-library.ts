@@ -1,60 +1,88 @@
-import { gameRepository } from "@main/repository";
-
 import { registerEvent } from "../register-event";
-
 import type { GameShop } from "@types";
-import { getFileBase64, getSteamAppAsset } from "@main/helpers";
-
-import { steamGamesWorker } from "@main/workers";
 import { createGame } from "@main/services/library-sync";
+import {
+  gamesShopAssetsSublevel,
+  gamesShopCacheSublevel,
+  gamesSublevel,
+  levelKeys,
+} from "@main/level";
+import { clearFinishedDownload } from "@main/helpers";
+import { AchievementWatcherManager } from "@main/services/achievements/achievement-watcher-manager";
+
+const lookupCachedPlatform = async (
+  shop: GameShop,
+  objectId: string
+): Promise<string | null> => {
+  const prefix = `${shop}:${objectId}:`;
+  try {
+    const entries = await gamesShopCacheSublevel.iterator().all();
+    for (const [key, value] of entries) {
+      if (
+        typeof key === "string" &&
+        key.startsWith(prefix) &&
+        value?.platform
+      ) {
+        return value.platform;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+};
 
 const addGameToLibrary = async (
   _event: Electron.IpcMainInvokeEvent,
-  objectID: string,
+  shop: GameShop,
+  objectId: string,
   title: string,
-  shop: GameShop
+  platform?: string | null
 ) => {
-  return gameRepository
-    .update(
-      {
-        objectID,
-      },
-      {
-        shop,
-        status: null,
-        isDeleted: false,
-      }
-    )
-    .then(async ({ affected }) => {
-      if (!affected) {
-        const steamGame = await steamGamesWorker.run(Number(objectID), {
-          name: "getById",
-        });
+  const gameKey = levelKeys.game(shop, objectId);
+  let game = await gamesSublevel.get(gameKey);
 
-        const iconUrl = steamGame?.clientIcon
-          ? getSteamAppAsset("icon", objectID, steamGame.clientIcon)
-          : null;
+  const gameAssets = await gamesShopAssetsSublevel.get(gameKey);
 
-        await gameRepository
-          .insert({
-            title,
-            iconUrl,
-            objectID,
-            shop,
-          })
-          .then(() => {
-            if (iconUrl) {
-              getFileBase64(iconUrl).then((base64) =>
-                gameRepository.update({ objectID }, { iconUrl: base64 })
-              );
-            }
-          });
-      }
+  const resolvedPlatform =
+    platform ??
+    (shop === "launchbox" ? await lookupCachedPlatform(shop, objectId) : null);
 
-      const game = await gameRepository.findOne({ where: { objectID } });
+  if (game) {
+    await clearFinishedDownload(shop, objectId);
 
-      createGame(game!);
-    });
+    game.isDeleted = false;
+    game.addedToLibraryAt ??= new Date();
+    if (resolvedPlatform && !game.platform) game.platform = resolvedPlatform;
+
+    await gamesSublevel.put(gameKey, game);
+  } else {
+    game = {
+      title,
+      iconUrl: gameAssets?.iconUrl ?? null,
+      libraryHeroImageUrl: gameAssets?.libraryHeroImageUrl ?? null,
+      logoImageUrl: gameAssets?.logoImageUrl ?? null,
+      objectId,
+      shop,
+      remoteId: null,
+      isDeleted: false,
+      playTimeInMilliseconds: 0,
+      lastTimePlayed: null,
+      addedToLibraryAt: new Date(),
+      platform: resolvedPlatform ?? null,
+    };
+
+    await gamesSublevel.put(gameKey, game);
+  }
+
+  if (game) {
+    await createGame(game).catch(() => {});
+
+    AchievementWatcherManager.firstSyncWithRemoteIfNeeded(
+      game.shop,
+      game.objectId
+    );
+  }
 };
 
 registerEvent("addGameToLibrary", addGameToLibrary);

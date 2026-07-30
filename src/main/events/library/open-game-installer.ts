@@ -1,46 +1,120 @@
 import { shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
-import { writeFile } from "node:fs/promises";
-import { spawnSync, exec } from "node:child_process";
+import { spawn } from "node:child_process";
 
-import { gameRepository } from "@main/repository";
-
-import { generateYML } from "../helpers/generate-lutris-yaml";
 import { getDownloadsPath } from "../helpers/get-downloads-path";
 import { registerEvent } from "../register-event";
+import { downloadsSublevel, gamesSublevel, levelKeys } from "@main/level";
+import { GameShop } from "@types";
+import { logger, Umu, Wine } from "@main/services";
 
-const executeGameInstaller = (filePath: string) => {
+const launchInstallerWithWine = async (filePath: string): Promise<boolean> => {
+  return await new Promise<boolean>((resolve) => {
+    const child = spawn("wine", [filePath], {
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+    });
+
+    child.once("spawn", () => {
+      child.unref();
+      resolve(true);
+    });
+
+    child.once("error", (error) => {
+      logger.error("Failed to execute game installer with wine", error);
+      resolve(false);
+    });
+  });
+};
+
+const launchInstallerDirectly = async (filePath: string): Promise<boolean> => {
+  return await new Promise<boolean>((resolve) => {
+    const child = spawn(filePath, [], {
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+    });
+
+    child.once("spawn", () => {
+      child.unref();
+      resolve(true);
+    });
+
+    child.once("error", (error) => {
+      logger.error("Failed to execute game installer directly", error);
+      resolve(false);
+    });
+  });
+};
+
+const openPathAndCheck = async (filePath: string): Promise<boolean> => {
+  const openError = await shell.openPath(filePath);
+  return openError.length === 0;
+};
+
+const executeGameInstaller = async (
+  filePath: string,
+  options?: {
+    gameId?: string;
+    winePrefixPath?: string | null;
+    protonPath?: string | null;
+  }
+) => {
   if (process.platform === "win32") {
-    shell.openPath(filePath);
-    return true;
+    const launchedDirectly = await launchInstallerDirectly(filePath);
+    if (launchedDirectly) {
+      return true;
+    }
+
+    return await openPathAndCheck(filePath);
   }
 
-  if (spawnSync("which", ["wine"]).status === 0) {
-    exec(`wine "${filePath}"`);
-    return true;
+  if (process.platform === "linux") {
+    try {
+      await Umu.launchExecutable(filePath, [], {
+        gameId: options?.gameId,
+        winePrefixPath: options?.winePrefixPath,
+        protonPath: options?.protonPath,
+      });
+      return true;
+    } catch (error) {
+      logger.error("Failed to execute game installer with umu-run", error);
+
+      const launchedWithWine = await launchInstallerWithWine(filePath);
+      if (launchedWithWine) {
+        return true;
+      }
+
+      return await openPathAndCheck(filePath);
+    }
   }
 
-  return false;
+  return await openPathAndCheck(filePath);
 };
 
 const openGameInstaller = async (
   _event: Electron.IpcMainInvokeEvent,
-  gameId: number
+  shop: GameShop,
+  objectId: string
 ) => {
-  const game = await gameRepository.findOne({
-    where: { id: gameId, isDeleted: false },
-  });
+  const downloadKey = levelKeys.game(shop, objectId);
+  const download = await downloadsSublevel.get(downloadKey);
+  const game = await gamesSublevel.get(downloadKey).catch(() => null);
+  const effectiveWinePrefixPath = Wine.getEffectivePrefixPath(
+    game?.winePrefixPath,
+    objectId
+  );
 
-  if (!game || !game.folderName) return true;
+  if (!download?.folderName) return true;
 
   const gamePath = path.join(
-    game.downloadPath ?? (await getDownloadsPath()),
-    game.folderName!
+    download.downloadPath ?? (await getDownloadsPath()),
+    download.folderName
   );
 
   if (!fs.existsSync(gamePath)) {
-    await gameRepository.update({ id: gameId }, { status: null });
     return true;
   }
 
@@ -50,12 +124,17 @@ const openGameInstaller = async (
   }
 
   if (fs.lstatSync(gamePath).isFile()) {
-    return executeGameInstaller(gamePath);
+    shell.showItemInFolder(gamePath);
+    return true;
   }
 
   const setupPath = path.join(gamePath, "setup.exe");
   if (fs.existsSync(setupPath)) {
-    return executeGameInstaller(setupPath);
+    return await executeGameInstaller(setupPath, {
+      gameId: objectId,
+      winePrefixPath: effectiveWinePrefixPath,
+      protonPath: game?.protonPath,
+    });
   }
 
   const gamePathFileNames = fs.readdirSync(gamePath);
@@ -64,16 +143,14 @@ const openGameInstaller = async (
   );
 
   if (gamePathExecutableFiles.length === 1) {
-    return executeGameInstaller(
-      path.join(gamePath, gamePathExecutableFiles[0])
+    return await executeGameInstaller(
+      path.join(gamePath, gamePathExecutableFiles[0]),
+      {
+        gameId: objectId,
+        winePrefixPath: effectiveWinePrefixPath,
+        protonPath: game?.protonPath,
+      }
     );
-  }
-
-  if (spawnSync("which", ["lutris"]).status === 0) {
-    const ymlPath = path.join(gamePath, "setup.yml");
-    await writeFile(ymlPath, generateYML(game));
-    exec(`lutris --install "${ymlPath}"`);
-    return true;
   }
 
   shell.openPath(gamePath);

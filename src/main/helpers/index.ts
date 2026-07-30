@@ -1,46 +1,14 @@
 import axios from "axios";
+import { JSDOM } from "jsdom";
 import UserAgent from "user-agents";
-
-export const getSteamAppAsset = (
-  category: "library" | "hero" | "logo" | "icon",
-  objectID: string,
-  clientIcon?: string
-) => {
-  if (category === "library")
-    return `https://steamcdn-a.akamaihd.net/steam/apps/${objectID}/header.jpg`;
-
-  if (category === "hero")
-    return `https://steamcdn-a.akamaihd.net/steam/apps/${objectID}/library_hero.jpg`;
-
-  if (category === "logo")
-    return `https://cdn.cloudflare.steamstatic.com/steam/apps/${objectID}/logo.png`;
-
-  return `https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/${objectID}/${clientIcon}.ico`;
-};
+import path from "node:path";
+import fs from "node:fs";
+import { THEMES_PATH } from "@main/constants";
 
 export const getFileBuffer = async (url: string) =>
   fetch(url, { method: "GET" }).then((response) =>
     response.arrayBuffer().then((buffer) => Buffer.from(buffer))
   );
-
-export const getFileBase64 = async (url: string) =>
-  fetch(url, { method: "GET" }).then((response) =>
-    response.arrayBuffer().then((buffer) => {
-      const base64 = Buffer.from(buffer).toString("base64");
-      const contentType = response.headers.get("content-type");
-
-      return `data:${contentType};base64,${base64}`;
-    })
-  );
-
-export const steamUrlBuilder = {
-  library: (objectID: string) =>
-    `https://steamcdn-a.akamaihd.net/steam/apps/${objectID}/header.jpg`,
-  libraryHero: (objectID: string) =>
-    `https://steamcdn-a.akamaihd.net/steam/apps/${objectID}/library_hero.jpg`,
-  logo: (objectID: string) =>
-    `https://cdn.cloudflare.steamstatic.com/steam/apps/${objectID}/logo.png`,
-};
 
 export const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -48,13 +16,88 @@ export const sleep = (ms: number) =>
 export const requestWebPage = async (url: string) => {
   const userAgent = new UserAgent();
 
-  return axios
+  const data = await axios
     .get(url, {
       headers: {
         "User-Agent": userAgent.toString(),
       },
     })
     .then((response) => response.data);
+
+  const { window } = new JSDOM(data);
+  return window.document;
 };
 
-export * from "./download-source";
+export const isPortableVersion = () => {
+  return !!process.env.PORTABLE_EXECUTABLE_FILE;
+};
+
+export const normalizePath = (str: string) =>
+  path.posix.normalize(str).replaceAll("\\", "/");
+
+export const addTrailingSlash = (str: string) =>
+  str.endsWith("/") ? str : `${str}/`;
+
+const sanitizeFolderName = (name: string): string => {
+  return name
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9-_\s]/g, "")
+    .replaceAll(/\s+/g, "-")
+    .replaceAll(/-+/g, "-")
+    .replaceAll(/(^-|-$)/g, "");
+};
+
+export const getThemePath = (themeId: string, themeName?: string): string => {
+  if (themeName) {
+    const sanitizedName = sanitizeFolderName(themeName);
+    if (sanitizedName) {
+      return path.join(THEMES_PATH, sanitizedName);
+    }
+  }
+  return path.join(THEMES_PATH, themeId);
+};
+
+export const getThemeSoundPath = (
+  themeId: string,
+  themeName?: string
+): string | null => {
+  const themeDir = getThemePath(themeId, themeName);
+  const legacyThemeDir = themeName ? path.join(THEMES_PATH, themeId) : null;
+
+  const checkDir = (dir: string): string | null => {
+    if (!fs.existsSync(dir)) {
+      return null;
+    }
+
+    const formats = ["wav", "mp3", "ogg", "m4a"];
+
+    for (const format of formats) {
+      const soundPath = path.join(dir, `achievement.${format}`);
+      if (fs.existsSync(soundPath)) {
+        return soundPath;
+      }
+    }
+
+    return null;
+  };
+
+  const soundPath = checkDir(themeDir);
+  if (soundPath) {
+    return soundPath;
+  }
+
+  if (legacyThemeDir) {
+    return checkDir(legacyThemeDir);
+  }
+
+  return null;
+};
+
+export * from "./reg-parser";
+export * from "./launch-game";
+export * from "./launch-classics-game";
+export * from "./open-classics-game";
+export * from "./download-error-handler";
+export * from "./download-game-helper";
+export * from "./platform-to-system";
+export * from "./global-trackers";

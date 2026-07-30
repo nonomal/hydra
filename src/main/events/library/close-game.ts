@@ -1,8 +1,13 @@
-import { gameRepository } from "@main/repository";
 import { registerEvent } from "../register-event";
-import { PythonInstance, logger } from "@main/services";
+import { emulators, launchedGamePids, logger, Wine } from "@main/services";
 import sudo from "sudo-prompt";
 import { app } from "electron";
+import { gamesSublevel, levelKeys } from "@main/level";
+import { GameShop } from "@types";
+import path from "node:path";
+import { NativeAddon } from "@main/services/native-addon";
+import { processReferencesExecutable } from "@main/services/linux-process-match";
+import { isWindowsBatchFile } from "@main/helpers/windows-batch-command";
 
 const getKillCommand = (pid: number) => {
   if (process.platform == "win32") {
@@ -14,25 +19,100 @@ const getKillCommand = (pid: number) => {
 
 const closeGame = async (
   _event: Electron.IpcMainInvokeEvent,
-  gameId: number
+  shop: GameShop,
+  objectId: string
 ) => {
-  const processes = await PythonInstance.getProcessList();
-  const game = await gameRepository.findOne({
-    where: { id: gameId, isDeleted: false },
-  });
+  if (emulators.closeEmulatorSession(levelKeys.game(shop, objectId))) return;
+
+  const processes = await NativeAddon.listProcesses();
+
+  const game = await gamesSublevel.get(levelKeys.game(shop, objectId));
 
   if (!game) return;
 
-  const gameProcess = processes.find((runningProcess) => {
-    return runningProcess.exe === game.executablePath;
+  const launchedPid = launchedGamePids.get(levelKeys.game(shop, objectId));
+  const trackingPaths = game.trackingExecutablePaths?.filter(Boolean) ?? [];
+  const targetPaths =
+    game.executablePath && !isWindowsBatchFile(game.executablePath)
+      ? [game.executablePath, ...trackingPaths]
+      : trackingPaths;
+
+  const gameProcesses = processes.filter((runningProcess) => {
+    const matchesTargetPath = targetPaths.some((targetPath) => {
+      if (process.platform === "linux") {
+        return processReferencesExecutable(
+          {
+            cwd: runningProcess.cwd,
+            exe: runningProcess.exe,
+            appImagePath: runningProcess.environ?.APPIMAGE,
+          },
+          targetPath
+        );
+      }
+
+      return runningProcess.exe === targetPath;
+    });
+
+    if (matchesTargetPath) return true;
+
+    return (
+      process.platform === "linux" &&
+      runningProcess.pid === launchedPid &&
+      processReferencesExecutable(
+        {
+          cwd: runningProcess.cwd,
+          exe: runningProcess.exe,
+          appImagePath: runningProcess.environ?.APPIMAGE,
+        },
+        game.executablePath ?? ""
+      )
+    );
   });
 
-  if (gameProcess) {
+  const linuxFallbackProcess =
+    process.platform === "linux" &&
+    !gameProcesses.length &&
+    game.executablePath?.toLowerCase().endsWith(".exe")
+      ? processes.find((runningProcess) => {
+          const processCwd = runningProcess.cwd?.toLowerCase();
+          const gameDirectory = path
+            .dirname(game.executablePath!)
+            .toLowerCase();
+
+          if (!processCwd || processCwd !== gameDirectory) {
+            return false;
+          }
+
+          const expectedPrefix = Wine.getEffectivePrefixPath(
+            game.winePrefixPath,
+            game.objectId
+          )?.toLowerCase();
+          const processPrefix =
+            runningProcess.environ?.STEAM_COMPAT_DATA_PATH?.toLowerCase();
+
+          if (
+            expectedPrefix &&
+            processPrefix &&
+            processPrefix !== expectedPrefix
+          ) {
+            return false;
+          }
+
+          return runningProcess.exe?.toLowerCase().includes("wine") ?? false;
+        })
+      : null;
+
+  const fallbackProcesses = linuxFallbackProcess ? [linuxFallbackProcess] : [];
+  const processesToClose = gameProcesses.length
+    ? gameProcesses
+    : fallbackProcesses;
+
+  for (const processToClose of processesToClose) {
     try {
-      process.kill(gameProcess.pid);
-    } catch (err) {
+      process.kill(processToClose.pid);
+    } catch {
       sudo.exec(
-        getKillCommand(gameProcess.pid),
+        getKillCommand(processToClose.pid),
         { name: app.getName() },
         (error, _stdout, _stderr) => {
           logger.error(error);

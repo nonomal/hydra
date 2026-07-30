@@ -1,42 +1,50 @@
 import { registerEvent } from "../register-event";
-import { dataSource } from "@main/data-source";
-import { DownloadSource } from "@main/entity";
-import axios from "axios";
-import { downloadSourceSchema } from "../helpers/validators";
-import { insertDownloadsFromSource } from "@main/helpers";
-import { RepacksManager } from "@main/services";
+import { HydraApi } from "@main/services/hydra-api";
+import { downloadSourcesSublevel } from "@main/level";
+import type { DownloadSource } from "@types";
+import { logger } from "@main/services";
 
 const addDownloadSource = async (
   _event: Electron.IpcMainInvokeEvent,
   url: string
 ) => {
-  const response = await axios.get(url);
+  try {
+    const existingSources = await downloadSourcesSublevel.values().all();
+    const urlExists = existingSources.some((source) => source.url === url);
 
-  const source = downloadSourceSchema.parse(response.data);
-
-  const downloadSource = await dataSource.transaction(
-    async (transactionalEntityManager) => {
-      const downloadSource = await transactionalEntityManager
-        .getRepository(DownloadSource)
-        .save({
-          url,
-          name: source.name,
-          downloadCount: source.downloads.length,
-        });
-
-      await insertDownloadsFromSource(
-        transactionalEntityManager,
-        downloadSource,
-        source.downloads
-      );
-
-      return downloadSource;
+    if (urlExists) {
+      throw new Error("Download source with this URL already exists");
     }
-  );
 
-  await RepacksManager.updateRepacks();
+    const downloadSource = await HydraApi.post<DownloadSource>(
+      "/download-sources",
+      {
+        url,
+      },
+      { needsAuth: false }
+    );
 
-  return downloadSource;
+    if (HydraApi.isLoggedIn() && HydraApi.hasActiveSubscription()) {
+      try {
+        await HydraApi.post("/profile/download-sources", {
+          urls: [url],
+        });
+      } catch (error) {
+        logger.error("Failed to add download source to profile:", error);
+      }
+    }
+
+    await downloadSourcesSublevel.put(downloadSource.id, {
+      ...downloadSource,
+      isRemote: true,
+      createdAt: new Date().toISOString(),
+    });
+
+    return downloadSource;
+  } catch (error) {
+    logger.error("Failed to add download source:", error);
+    throw error;
+  }
 };
 
 registerEvent("addDownloadSource", addDownloadSource);

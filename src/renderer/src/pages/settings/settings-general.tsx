@@ -1,24 +1,43 @@
-import { useContext, useEffect, useState } from "react";
-import ISO6391 from "iso-639-1";
-
+import {
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  useCallback,
+  useRef,
+} from "react";
 import {
   TextField,
   Button,
   CheckboxField,
   SelectField,
 } from "@renderer/components";
+import type { DownloadDirectoryPreference } from "@types";
 import { useTranslation } from "react-i18next";
-
 import { useAppSelector } from "@renderer/hooks";
-
 import { changeLanguage } from "i18next";
-import * as languageResources from "@locales";
+import languageResources from "@locales";
 import { orderBy } from "lodash-es";
 import { settingsContext } from "@renderer/context";
+import "./settings-general.scss";
+import { DesktopDownloadIcon, UnmuteIcon } from "@primer/octicons-react";
+import { logger } from "@renderer/logger";
+import { AchievementCustomNotificationPosition } from "@types";
+import {
+  prepareDefaultDownloadPathSync,
+  replaceSavedDownloadDirectoryAndSetDefault,
+} from "@shared";
+import { DownloadDirectoryReplacementModal } from "./download-directory-replacement-modal";
 
 interface LanguageOption {
   option: string;
   nativeName: string;
+}
+
+interface DownloadDirectoryReplacementState {
+  nextPath: string;
+  replaceableDirectories: DownloadDirectoryPreference[];
+  selectedReplacementPath: string;
 }
 
 export function SettingsGeneral() {
@@ -30,29 +49,52 @@ export function SettingsGeneral() {
     (state) => state.userPreferences.value
   );
 
+  const [canInstallCommonRedist, setCanInstallCommonRedist] = useState(false);
+  const [installingCommonRedist, setInstallingCommonRedist] = useState(false);
+
   const [form, setForm] = useState({
     downloadsPath: "",
     downloadNotificationsEnabled: false,
     repackUpdatesNotificationsEnabled: false,
+    friendRequestNotificationsEnabled: false,
+    friendStartGameNotificationsEnabled: true,
+    achievementNotificationsEnabled: true,
+    achievementCustomNotificationsEnabled: true,
+    achievementCustomNotificationPosition:
+      "top-left" as AchievementCustomNotificationPosition,
+    achievementSoundVolume: 15,
     language: "",
+    customStyles: window.localStorage.getItem("customStyles") || "",
   });
 
   const [languageOptions, setLanguageOptions] = useState<LanguageOption[]>([]);
 
   const [defaultDownloadsPath, setDefaultDownloadsPath] = useState("");
+  const [downloadDirectoryReplacement, setDownloadDirectoryReplacement] =
+    useState<DownloadDirectoryReplacementState | null>(null);
+
+  const volumeUpdateTimeoutRef = useRef<NodeJS.Timeout>();
 
   useEffect(() => {
-    async function fetchdefaultDownloadsPath() {
-      setDefaultDownloadsPath(await window.electron.getDefaultDownloadsPath());
-    }
+    window.electron.getDefaultDownloadsPath().then((path) => {
+      setDefaultDownloadsPath(path);
+    });
 
-    fetchdefaultDownloadsPath();
+    window.electron.canInstallCommonRedist().then((canInstall) => {
+      setCanInstallCommonRedist(canInstall);
+    });
+
+    const redistInterval = setInterval(() => {
+      window.electron.canInstallCommonRedist().then((canInstall) => {
+        setCanInstallCommonRedist(canInstall);
+      });
+    }, 1000 * 5);
 
     setLanguageOptions(
       orderBy(
-        Object.keys(languageResources).map((language) => {
+        Object.entries(languageResources).map(([language, value]) => {
           return {
-            nativeName: ISO6391.getNativeName(language),
+            nativeName: value.language_name,
             option: language,
           };
         }),
@@ -60,23 +102,105 @@ export function SettingsGeneral() {
         "asc"
       )
     );
+
+    return () => {
+      clearInterval(redistInterval);
+      if (volumeUpdateTimeoutRef.current) {
+        clearTimeout(volumeUpdateTimeoutRef.current);
+      }
+    };
   }, []);
 
-  useEffect(updateFormWithUserPreferences, [
-    userPreferences,
-    defaultDownloadsPath,
-  ]);
+  useEffect(() => {
+    if (userPreferences) {
+      const languageKeys = Object.keys(languageResources);
+      const language =
+        languageKeys.find(
+          (language) => language === userPreferences.language
+        ) ??
+        languageKeys.find((language) => {
+          return language.startsWith(
+            userPreferences.language?.split("-")[0] ?? "en"
+          );
+        });
 
-  const handleLanguageChange = (event) => {
+      setForm((prev) => ({
+        ...prev,
+        downloadsPath: userPreferences.downloadsPath ?? defaultDownloadsPath,
+        downloadNotificationsEnabled:
+          userPreferences.downloadNotificationsEnabled ?? false,
+        repackUpdatesNotificationsEnabled:
+          userPreferences.repackUpdatesNotificationsEnabled ?? false,
+        achievementNotificationsEnabled:
+          userPreferences.achievementNotificationsEnabled ?? true,
+        achievementCustomNotificationsEnabled:
+          userPreferences.achievementCustomNotificationsEnabled ?? true,
+        achievementCustomNotificationPosition:
+          userPreferences.achievementCustomNotificationPosition ?? "top-left",
+        achievementSoundVolume: Math.round(
+          (userPreferences.achievementSoundVolume ?? 0.15) * 100
+        ),
+        friendRequestNotificationsEnabled:
+          userPreferences.friendRequestNotificationsEnabled ?? false,
+        friendStartGameNotificationsEnabled:
+          userPreferences.friendStartGameNotificationsEnabled ?? true,
+        language: language ?? "en",
+      }));
+    }
+  }, [userPreferences, defaultDownloadsPath]);
+
+  const achievementCustomNotificationPositionOptions = useMemo(() => {
+    return [
+      "top-left",
+      "top-center",
+      "top-right",
+      "bottom-left",
+      "bottom-center",
+      "bottom-right",
+    ].map((position) => ({
+      key: position,
+      value: position,
+      label: t(position),
+    }));
+  }, [t]);
+
+  const handleLanguageChange = (
+    event: React.ChangeEvent<HTMLSelectElement>
+  ) => {
     const value = event.target.value;
 
     handleChange({ language: value });
     changeLanguage(value);
   };
 
-  const handleChange = (values: Partial<typeof form>) => {
+  const handleChange = async (values: Partial<typeof form>) => {
     setForm((prev) => ({ ...prev, ...values }));
-    updateUserPreferences(values);
+    await updateUserPreferences(values);
+  };
+
+  const handleVolumeChange = useCallback(
+    (newVolume: number) => {
+      setForm((prev) => ({ ...prev, achievementSoundVolume: newVolume }));
+
+      if (volumeUpdateTimeoutRef.current) {
+        clearTimeout(volumeUpdateTimeoutRef.current);
+      }
+
+      volumeUpdateTimeoutRef.current = setTimeout(() => {
+        updateUserPreferences({ achievementSoundVolume: newVolume / 100 });
+      }, 300);
+    },
+    [updateUserPreferences]
+  );
+
+  const handleChangeAchievementCustomNotificationPosition = async (
+    event: React.ChangeEvent<HTMLSelectElement>
+  ) => {
+    const value = event.target.value as AchievementCustomNotificationPosition;
+
+    await handleChange({ achievementCustomNotificationPosition: value });
+
+    window.electron.updateAchievementCustomNotificationWindow();
   };
 
   const handleChooseDownloadsPath = async () => {
@@ -85,30 +209,85 @@ export function SettingsGeneral() {
       properties: ["openDirectory"],
     });
 
-    if (filePaths && filePaths.length > 0) {
-      const path = filePaths[0];
-      handleChange({ downloadsPath: path });
+    const path = filePaths?.[0];
+
+    if (!path || !defaultDownloadsPath) {
+      return;
+    }
+
+    const nextAction = prepareDefaultDownloadPathSync(
+      userPreferences,
+      path,
+      defaultDownloadsPath
+    );
+
+    if (nextAction.type === "noop") {
+      return;
+    }
+
+    if (
+      nextAction.type === "set-existing" ||
+      nextAction.type === "add-and-set"
+    ) {
+      setForm((prev) => ({
+        ...prev,
+        downloadsPath: nextAction.nextDefaultPath,
+      }));
+      await updateUserPreferences(nextAction.nextPreferences);
+      return;
+    }
+
+    setDownloadDirectoryReplacement({
+      nextPath: nextAction.nextPath,
+      replaceableDirectories: nextAction.replaceableDirectories,
+      selectedReplacementPath: nextAction.recommendedReplacementPath,
+    });
+  };
+
+  const handleConfirmDownloadDirectoryReplacement = async () => {
+    if (!downloadDirectoryReplacement || !defaultDownloadsPath) {
+      return;
+    }
+
+    const replacement = replaceSavedDownloadDirectoryAndSetDefault(
+      userPreferences,
+      downloadDirectoryReplacement.nextPath,
+      downloadDirectoryReplacement.selectedReplacementPath,
+      defaultDownloadsPath
+    );
+
+    setForm((prev) => ({
+      ...prev,
+      downloadsPath: replacement.nextDefaultPath,
+    }));
+    setDownloadDirectoryReplacement(null);
+    await updateUserPreferences(replacement.nextPreferences);
+  };
+
+  useEffect(() => {
+    const unlisten = window.electron.onCommonRedistProgress(
+      ({ log, complete }) => {
+        if (log === "Installation timed out" || complete) {
+          setInstallingCommonRedist(false);
+        }
+      }
+    );
+
+    return () => unlisten();
+  }, []);
+
+  const handleInstallCommonRedist = async () => {
+    setInstallingCommonRedist(true);
+    try {
+      await window.electron.installCommonRedist();
+    } catch (err) {
+      logger.error(err);
+      setInstallingCommonRedist(false);
     }
   };
 
-  function updateFormWithUserPreferences() {
-    if (userPreferences) {
-      const parsedLanguage = userPreferences.language.split("-")[0];
-
-      setForm((prev) => ({
-        ...prev,
-        downloadsPath: userPreferences.downloadsPath ?? defaultDownloadsPath,
-        downloadNotificationsEnabled:
-          userPreferences.downloadNotificationsEnabled,
-        repackUpdatesNotificationsEnabled:
-          userPreferences.repackUpdatesNotificationsEnabled,
-        language: parsedLanguage,
-      }));
-    }
-  }
-
   return (
-    <>
+    <div className="settings-general">
       <TextField
         label={t("downloads_path")}
         value={form.downloadsPath}
@@ -132,29 +311,170 @@ export function SettingsGeneral() {
         }))}
       />
 
-      <h3>{t("notifications")}</h3>
-      <>
-        <CheckboxField
-          label={t("enable_download_notifications")}
-          checked={form.downloadNotificationsEnabled}
-          onChange={() =>
-            handleChange({
-              downloadNotificationsEnabled: !form.downloadNotificationsEnabled,
-            })
-          }
-        />
+      <h2 className="settings-general__section-title">{t("downloads")}</h2>
 
-        <CheckboxField
-          label={t("enable_repack_list_notifications")}
-          checked={form.repackUpdatesNotificationsEnabled}
-          onChange={() =>
-            handleChange({
-              repackUpdatesNotificationsEnabled:
-                !form.repackUpdatesNotificationsEnabled,
-            })
-          }
-        />
-      </>
-    </>
+      <h2 className="settings-general__section-title">{t("notifications")}</h2>
+
+      <CheckboxField
+        label={t("enable_download_notifications")}
+        checked={form.downloadNotificationsEnabled}
+        onChange={() =>
+          handleChange({
+            downloadNotificationsEnabled: !form.downloadNotificationsEnabled,
+          })
+        }
+      />
+
+      <CheckboxField
+        label={t("enable_repack_list_notifications")}
+        checked={form.repackUpdatesNotificationsEnabled}
+        onChange={() =>
+          handleChange({
+            repackUpdatesNotificationsEnabled:
+              !form.repackUpdatesNotificationsEnabled,
+          })
+        }
+      />
+
+      <CheckboxField
+        label={t("enable_friend_request_notifications")}
+        checked={form.friendRequestNotificationsEnabled}
+        onChange={() =>
+          handleChange({
+            friendRequestNotificationsEnabled:
+              !form.friendRequestNotificationsEnabled,
+          })
+        }
+      />
+
+      <CheckboxField
+        label={t("enable_friend_start_game_notifications")}
+        checked={form.friendStartGameNotificationsEnabled}
+        onChange={() =>
+          handleChange({
+            friendStartGameNotificationsEnabled:
+              !form.friendStartGameNotificationsEnabled,
+          })
+        }
+      />
+
+      <CheckboxField
+        label={t("enable_achievement_notifications")}
+        checked={form.achievementNotificationsEnabled}
+        onChange={async () => {
+          await handleChange({
+            achievementNotificationsEnabled:
+              !form.achievementNotificationsEnabled,
+          });
+
+          window.electron.updateAchievementCustomNotificationWindow();
+        }}
+      />
+
+      <CheckboxField
+        label={t("enable_achievement_custom_notifications")}
+        checked={form.achievementCustomNotificationsEnabled}
+        disabled={!form.achievementNotificationsEnabled}
+        onChange={async () => {
+          await handleChange({
+            achievementCustomNotificationsEnabled:
+              !form.achievementCustomNotificationsEnabled,
+          });
+
+          window.electron.updateAchievementCustomNotificationWindow();
+        }}
+      />
+
+      {form.achievementNotificationsEnabled &&
+        form.achievementCustomNotificationsEnabled && (
+          <>
+            <SelectField
+              className="settings-general__achievement-custom-notification-position__select-variation"
+              label={t("achievement_custom_notification_position")}
+              value={form.achievementCustomNotificationPosition}
+              onChange={handleChangeAchievementCustomNotificationPosition}
+              options={achievementCustomNotificationPositionOptions}
+            />
+
+            <Button
+              className="settings-general__test-achievement-notification-button"
+              onClick={() => window.electron.showAchievementTestNotification()}
+            >
+              {t("test_notification")}
+            </Button>
+          </>
+        )}
+
+      {form.achievementNotificationsEnabled && (
+        <div className="settings-general__volume-control">
+          <label htmlFor="achievement-volume">
+            {t("achievement_sound_volume")}
+          </label>
+          <div className="settings-general__volume-slider-wrapper">
+            <UnmuteIcon size={16} className="settings-general__volume-icon" />
+            <input
+              id="achievement-volume"
+              type="range"
+              min="0"
+              max="100"
+              value={form.achievementSoundVolume}
+              onChange={(e) => {
+                const volumePercent = parseInt(e.target.value, 10);
+                if (!isNaN(volumePercent)) {
+                  handleVolumeChange(volumePercent);
+                }
+              }}
+              className="settings-general__volume-slider"
+              style={
+                {
+                  "--volume-percent": `${form.achievementSoundVolume}%`,
+                } as React.CSSProperties
+              }
+            />
+            <span className="settings-general__volume-value">
+              {form.achievementSoundVolume}%
+            </span>
+          </div>
+        </div>
+      )}
+
+      <h2 className="settings-general__section-title">{t("common_redist")}</h2>
+
+      <p className="settings-general__common-redist-description">
+        {t("common_redist_description")}
+      </p>
+
+      <Button
+        onClick={handleInstallCommonRedist}
+        className="settings-general__common-redist-button"
+        disabled={!canInstallCommonRedist || installingCommonRedist}
+      >
+        <DesktopDownloadIcon />
+        {installingCommonRedist
+          ? t("installing_common_redist")
+          : t("install_common_redist")}
+      </Button>
+
+      <DownloadDirectoryReplacementModal
+        visible={downloadDirectoryReplacement !== null}
+        nextPath={downloadDirectoryReplacement?.nextPath ?? ""}
+        directories={downloadDirectoryReplacement?.replaceableDirectories ?? []}
+        selectedReplacementPath={
+          downloadDirectoryReplacement?.selectedReplacementPath ?? ""
+        }
+        onSelectedReplacementPathChange={(path) => {
+          setDownloadDirectoryReplacement((current) =>
+            current
+              ? {
+                  ...current,
+                  selectedReplacementPath: path,
+                }
+              : current
+          );
+        }}
+        onClose={() => setDownloadDirectoryReplacement(null)}
+        onConfirm={handleConfirmDownloadDirectoryReplacement}
+      />
+    </div>
   );
 }

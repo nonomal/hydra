@@ -1,16 +1,10 @@
-import { downloadSourceRepository } from "@main/repository";
+import { downloadSourcesSublevel } from "@main/level";
 import { registerEvent } from "../register-event";
+import { orderBy } from "lodash-es";
 
 const getDownloadSources = async (_event: Electron.IpcMainInvokeEvent) => {
-  return downloadSourceRepository
-    .createQueryBuilder("downloadSource")
-    .leftJoin("downloadSource.repacks", "repacks")
-    .orderBy("downloadSource.createdAt", "DESC")
-    .loadRelationCountAndMap(
-      "downloadSource.repackCount",
-      "downloadSource.repacks"
-    )
-    .getMany();
+  const allSources = await downloadSourcesSublevel.values().all();
+  return orderBy(allSources, "createdAt", "desc");
 };
 
 registerEvent("getDownloadSources", getDownloadSources);

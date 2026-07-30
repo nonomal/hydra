@@ -1,66 +1,200 @@
-import { Button } from "@renderer/components";
-
-import * as styles from "./settings.css";
 import { useTranslation } from "react-i18next";
-import { SettingsRealDebrid } from "./settings-real-debrid";
-import { SettingsGeneral } from "./settings-general";
-import { SettingsBehavior } from "./settings-behavior";
-
-import { SettingsDownloadSources } from "./settings-download-sources";
 import {
   SettingsContextConsumer,
   SettingsContextProvider,
 } from "@renderer/context";
+import { SettingsAccount } from "./settings-account";
+import { useUserDetails } from "@renderer/hooks";
+import { Fragment, useMemo } from "react";
+import "./settings.scss";
+import {
+  BellIcon,
+  CloudIcon,
+  DownloadIcon,
+  GearIcon,
+  LinkIcon,
+  PlayIcon,
+  VideoIcon,
+  ShieldCheckIcon,
+} from "@primer/octicons-react";
+import { Gamepad2, Wrench } from "lucide-react";
+import { SettingsContextGeneral } from "./settings-context-general";
+import { SettingsContextDownloads } from "./settings-context-downloads";
+import { SettingsContextDownloadSources } from "./settings-context-download-sources";
+import { SettingsContextNotifications } from "./settings-context-notifications";
+import { SettingsContextContentGameplay } from "./settings-context-content-gameplay";
+import { SettingsContextIntegrations } from "./settings-context-integrations";
+import { SettingsContextCompatibility } from "./settings-context-compatibility";
+import { SettingsContextBigPicture } from "./settings-context-big-picture";
+import { SettingsContextEmulation } from "./emulation/settings-context-emulation";
 
-export function Settings() {
+export default function Settings() {
   const { t } = useTranslation("settings");
 
-  const categories = [
-    t("general"),
-    t("behavior"),
-    t("download_sources"),
-    "Real-Debrid",
-  ];
+  const { userDetails } = useUserDetails();
+
+  const categories = useMemo(
+    () => [
+      {
+        id: "general" as const,
+        label: t("general"),
+        icon: <GearIcon size={16} />,
+      },
+      {
+        id: "downloads" as const,
+        label: t("downloads"),
+        icon: <DownloadIcon size={16} />,
+      },
+      {
+        id: "download_sources" as const,
+        label: t("download_sources"),
+        icon: <LinkIcon size={16} />,
+      },
+      {
+        id: "notifications" as const,
+        label: t("notifications"),
+        icon: <BellIcon size={16} />,
+      },
+      {
+        id: "content_gameplay" as const,
+        label: t("content_gameplay"),
+        icon: <PlayIcon size={16} />,
+      },
+      {
+        id: "integrations" as const,
+        label: t("integrations"),
+        icon: <CloudIcon size={16} />,
+      },
+      {
+        id: "compatibility" as const,
+        label: t("compatibility"),
+        icon: <Wrench size={16} />,
+      },
+      ...(userDetails
+        ? [
+            {
+              id: "account_privacy" as const,
+              label: `${t("account")} & ${t("privacy")}`,
+              icon: <ShieldCheckIcon size={16} />,
+            },
+          ]
+        : []),
+      {
+        id: "big_picture" as const,
+        label: t("big_picture"),
+        icon: <VideoIcon size={16} />,
+      },
+      {
+        id: "emulation" as const,
+        label: t("emulation"),
+        icon: <Gamepad2 size={16} />,
+        group: "classics" as const,
+      },
+    ],
+    [t, userDetails]
+  );
 
   return (
     <SettingsContextProvider>
       <SettingsContextConsumer>
-        {({ currentCategoryIndex, setCurrentCategoryIndex }) => {
+        {({ currentCategoryId, setCurrentCategoryId, appearance }) => {
+          const currentCategory =
+            categories.find((category) => category.id === currentCategoryId) ??
+            categories[0];
+          const selectedCategoryId = currentCategory.id;
+
           const renderCategory = () => {
-            if (currentCategoryIndex === 0) {
-              return <SettingsGeneral />;
+            if (selectedCategoryId === "general") {
+              return <SettingsContextGeneral appearance={appearance} />;
             }
 
-            if (currentCategoryIndex === 1) {
-              return <SettingsBehavior />;
+            if (selectedCategoryId === "downloads") {
+              return <SettingsContextDownloads />;
             }
 
-            if (currentCategoryIndex === 2) {
-              return <SettingsDownloadSources />;
+            if (selectedCategoryId === "download_sources") {
+              return <SettingsContextDownloadSources />;
             }
 
-            return <SettingsRealDebrid />;
+            if (selectedCategoryId === "notifications") {
+              return <SettingsContextNotifications />;
+            }
+
+            if (selectedCategoryId === "content_gameplay") {
+              return <SettingsContextContentGameplay />;
+            }
+
+            if (selectedCategoryId === "integrations") {
+              return <SettingsContextIntegrations />;
+            }
+
+            if (selectedCategoryId === "compatibility") {
+              return <SettingsContextCompatibility />;
+            }
+
+            if (selectedCategoryId === "big_picture") {
+              return <SettingsContextBigPicture />;
+            }
+
+            if (selectedCategoryId === "emulation") {
+              return <SettingsContextEmulation />;
+            }
+
+            return <SettingsAccount />;
           };
 
           return (
-            <section className={styles.container}>
-              <div className={styles.content}>
-                <section className={styles.settingsCategories}>
-                  {categories.map((category, index) => (
-                    <Button
-                      key={category}
-                      theme={
-                        currentCategoryIndex === index ? "primary" : "outline"
-                      }
-                      onClick={() => setCurrentCategoryIndex(index)}
-                    >
-                      {category}
-                    </Button>
-                  ))}
-                </section>
+            <section className="settings__container">
+              <div className="settings__content">
+                <aside className="settings__sidebar">
+                  {categories.map((category, index) => {
+                    const prevGroup =
+                      index > 0
+                        ? (categories[index - 1] as { group?: string }).group
+                        : undefined;
+                    const currentGroup = (category as { group?: string }).group;
+                    const showGroupHeader =
+                      currentGroup && currentGroup !== prevGroup;
 
-                <h2>{categories[currentCategoryIndex]}</h2>
-                {renderCategory()}
+                    return (
+                      <Fragment key={category.id}>
+                        {showGroupHeader && (
+                          <div className="settings__sidebar-group">
+                            <div className="settings__sidebar-divider" />
+                            <span className="settings__sidebar-group-label">
+                              {currentGroup === "classics"
+                                ? t("classics_group")
+                                : currentGroup}
+                            </span>
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className={`settings__sidebar-button ${
+                            currentCategory.id === category.id
+                              ? "settings__sidebar-button--active"
+                              : ""
+                          }`}
+                          onClick={() => setCurrentCategoryId(category.id)}
+                        >
+                          <span className="settings__sidebar-button-icon">
+                            {category.icon}
+                          </span>
+                          <span className="settings__sidebar-button-label">
+                            {category.label}
+                          </span>
+                        </button>
+                      </Fragment>
+                    );
+                  })}
+                </aside>
+
+                <div className="settings__panel">
+                  {selectedCategoryId !== "emulation" && (
+                    <h2>{currentCategory.label}</h2>
+                  )}
+                  {renderCategory()}
+                </div>
               </div>
             </section>
           );

@@ -1,20 +1,13 @@
-import { resolve } from "path";
+import react from "@vitejs/plugin-react";
 import {
   defineConfig,
+  externalizeDepsPlugin,
   loadEnv,
   swcPlugin,
-  externalizeDepsPlugin,
 } from "electron-vite";
-import react from "@vitejs/plugin-react";
-import { sentryVitePlugin } from "@sentry/vite-plugin";
-import { vanillaExtractPlugin } from "@vanilla-extract/vite-plugin";
+import { resolve } from "path";
 import svgr from "vite-plugin-svgr";
-
-const sentryPlugin = sentryVitePlugin({
-  authToken: process.env.SENTRY_AUTH_TOKEN,
-  org: "hydra-launcher",
-  project: "hydra-launcher",
-});
+import { scopeBigPictureCss } from "./src/big-picture/vite-scope-big-picture-css";
 
 export default defineConfig(({ mode }) => {
   loadEnv(mode);
@@ -23,9 +16,6 @@ export default defineConfig(({ mode }) => {
     main: {
       build: {
         sourcemap: true,
-        rollupOptions: {
-          external: ["better-sqlite3"],
-        },
       },
       resolve: {
         alias: {
@@ -35,14 +25,23 @@ export default defineConfig(({ mode }) => {
           "@shared": resolve("src/shared"),
         },
       },
-      plugins: [externalizeDepsPlugin(), swcPlugin(), sentryPlugin],
+      plugins: [externalizeDepsPlugin(), swcPlugin()],
     },
     preload: {
       plugins: [externalizeDepsPlugin()],
     },
-    renderer: {
+    bigPicture: {
+      root: "src/big-picture",
       build: {
-        sourcemap: true,
+        outDir: "out/big-picture",
+        rollupOptions: {
+          input: resolve("src/big-picture/index.html"),
+        },
+      },
+      css: {
+        postcss: {
+          plugins: [scopeBigPictureCss()],
+        },
       },
       resolve: {
         alias: {
@@ -51,7 +50,33 @@ export default defineConfig(({ mode }) => {
           "@shared": resolve("src/shared"),
         },
       },
-      plugins: [svgr(), react(), vanillaExtractPlugin(), sentryPlugin],
+      plugins: [svgr(), react()],
+    },
+    renderer: {
+      build: {
+        sourcemap: true,
+      },
+      esbuild: {
+        keepNames: true,
+      },
+      css: {
+        postcss: {
+          plugins: [scopeBigPictureCss()],
+        },
+        preprocessorOptions: {
+          scss: {
+            api: "modern",
+          },
+        },
+      },
+      resolve: {
+        alias: {
+          "@renderer": resolve("src/renderer/src"),
+          "@locales": resolve("src/locales"),
+          "@shared": resolve("src/shared"),
+        },
+      },
+      plugins: [svgr(), react()],
     },
   };
 });

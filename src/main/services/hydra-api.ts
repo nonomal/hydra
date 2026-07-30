@@ -1,27 +1,58 @@
-import { userAuthRepository } from "@main/repository";
 import axios, { AxiosError, AxiosInstance } from "axios";
 import { WindowManager } from "./window-manager";
 import url from "url";
 import { uploadGamesBatch } from "./library-sync";
 import { clearGamesRemoteIds } from "./library-sync/clear-games-remote-id";
-import { logger } from "./logger";
-import { UserNotLoggedInError } from "@shared";
+import { networkLogger as logger } from "./logger";
+import { UserNotLoggedInError, SubscriptionRequiredError } from "@shared";
+import { omit } from "lodash-es";
+import { appVersion } from "@main/constants";
+import { getUserData } from "./user/get-user-data";
+import { db } from "@main/level";
+import { levelKeys } from "@main/level/sublevels";
+import type { Auth, User } from "@types";
+import { SSEClient } from "./sse";
+
+export interface HydraApiOptions {
+  needsAuth?: boolean;
+  needsSubscription?: boolean;
+  ifModifiedSince?: Date;
+  ifNoneMatch?: string;
+  validateStatus?: (status: number) => boolean;
+  signal?: AbortSignal;
+}
+
+interface HydraApiUserAuth {
+  authToken: string;
+  refreshToken: string;
+  expirationTimestamp: number;
+  subscription: { expiresAt: Date | string | null } | null;
+}
 
 export class HydraApi {
   private static instance: AxiosInstance;
 
   private static readonly EXPIRATION_OFFSET_IN_MS = 1000 * 60 * 5; // 5 minutes
+  private static readonly ADD_LOG_INTERCEPTOR = true;
 
-  private static secondsToMilliseconds = (seconds: number) => seconds * 1000;
+  private static secondsToMilliseconds(seconds: number) {
+    return seconds * 1000;
+  }
 
-  private static userAuth = {
+  private static userAuth: HydraApiUserAuth = {
     authToken: "",
     refreshToken: "",
     expirationTimestamp: 0,
+    subscription: null,
   };
 
-  private static isLoggedIn() {
+  public static isLoggedIn() {
     return this.userAuth.authToken !== "";
+  }
+
+  public static hasActiveSubscription() {
+    const expiresAt = new Date(this.userAuth.subscription?.expiresAt ?? 0);
+    return expiresAt > new Date();
   }
 
   static async handleExternalAuth(uri: string) {
@@ -30,7 +61,7 @@ export class HydraApi {
     const decodedBase64 = atob(payload as string);
     const jsonData = JSON.parse(decodedBase64);
 
-    const { accessToken, expiresIn, refreshToken } = jsonData;
+    const { accessToken, expiresIn, refreshToken, workwondersJwt } = jsonData;
 
     const now = new Date();
 
@@ -43,129 +74,227 @@ export class HydraApi {
       authToken: accessToken,
       refreshToken: refreshToken,
       expirationTimestamp: tokenExpirationTimestamp,
+      subscription: null,
     };
 
-    logger.log("Sign in received", this.userAuth);
-
-    await userAuthRepository.upsert(
-      {
-        id: 1,
-        accessToken,
-        tokenExpirationTimestamp,
-        refreshToken,
-      },
-      ["id"]
+    const { AchievementWatcherManager } = await import(
+      "./achievements/achievement-watcher-manager"
     );
+    AchievementWatcherManager.resetSessionState();
+
+    logger.log(
+      "Sign in received. Token expiration timestamp:",
+      tokenExpirationTimestamp
+    );
+
+    db.put<string, Auth>(
+      levelKeys.auth,
+      {
+        accessToken,
+        refreshToken,
+        tokenExpirationTimestamp,
+        workwondersJwt,
+      },
+      { valueEncoding: "json" }
+    );
+
+    await getUserData().then((userDetails) => {
+      if (userDetails?.subscription) {
+        this.userAuth.subscription = {
+          expiresAt: userDetails.subscription.expiresAt
+            ? new Date(userDetails.subscription.expiresAt)
+            : null,
+        };
+      }
+    });
 
     if (WindowManager.mainWindow) {
       WindowManager.mainWindow.webContents.send("on-signin");
       await clearGamesRemoteIds();
-      uploadGamesBatch();
+      void uploadGamesBatch();
+
+      SSEClient.close();
+      SSEClient.connect();
+
+      const { syncDownloadSourcesFromApi } = await import("./user");
+      syncDownloadSourcesFromApi();
     }
+  }
+
+  static async handleSignOut() {
+    this.userAuth = {
+      authToken: "",
+      refreshToken: "",
+      expirationTimestamp: 0,
+      subscription: null,
+    };
+
+    const { AchievementWatcherManager } = await import(
+      "./achievements/achievement-watcher-manager"
+    );
+    AchievementWatcherManager.resetSessionState();
+
+    this.sendSignOutEvent();
+    this.post("/auth/logout", {}, { needsAuth: false }).catch(() => {});
   }
 
   static async setupApi() {
     this.instance = axios.create({
       baseURL: import.meta.env.MAIN_VITE_API_URL,
+      headers: { "User-Agent": `Hydra Launcher v${appVersion}` },
     });
 
-    this.instance.interceptors.request.use(
-      (request) => {
-        logger.log(" ---- REQUEST -----");
-        logger.log(request.method, request.url, request.params, request.data);
-        return request;
-      },
-      (error) => {
-        logger.error("request error", error);
-        return Promise.reject(error);
-      }
-    );
-
-    this.instance.interceptors.response.use(
-      (response) => {
-        logger.log(" ---- RESPONSE -----");
-        logger.log(
-          response.status,
-          response.config.method,
-          response.config.url,
-          response.data
-        );
-        return response;
-      },
-      (error) => {
-        logger.error(" ---- RESPONSE ERROR -----");
-
-        const { config } = error;
-
-        logger.error(
-          config.method,
-          config.baseURL,
-          config.url,
-          config.headers,
-          config.data
-        );
-
-        if (error.response) {
-          logger.error("Response", error.response.status, error.response.data);
-        } else if (error.request) {
-          logger.error("Request", error.request);
-        } else {
-          logger.error("Error", error.message);
+    if (this.ADD_LOG_INTERCEPTOR) {
+      this.instance.interceptors.request.use(
+        (request) => {
+          logger.log(" ---- REQUEST -----");
+          const data = Array.isArray(request.data)
+            ? request.data
+            : omit(request.data, ["token", "accessToken", "refreshToken"]);
+          logger.log(request.method, request.url, request.params, data);
+          return request;
+        },
+        (error) => {
+          logger.error("request error", error);
+          return Promise.reject(error);
         }
+      );
+      this.instance.interceptors.response.use(
+        (response) => {
+          logger.log(" ---- RESPONSE -----");
+          const data = Array.isArray(response.data)
+            ? response.data
+            : omit(response.data, [
+                "username",
+                "token",
+                "accessToken",
+                "refreshToken",
+              ]);
+          logger.log(
+            response.status,
+            response.config.method,
+            response.config.url,
+            data
+          );
+          return response;
+        },
+        (error) => {
+          logger.error(" ---- RESPONSE ERROR -----");
+          const { config } = error;
 
-        logger.error(" ----- END RESPONSE ERROR -------");
-        return Promise.reject(error);
-      }
-    );
+          const data = JSON.parse(config.data ?? null);
 
-    const userAuth = await userAuthRepository.findOne({
-      where: { id: 1 },
+          logger.error(
+            config.method,
+            config.baseURL,
+            config.url,
+            omit(config.headers, [
+              "accessToken",
+              "refreshToken",
+              "Authorization",
+            ]),
+            Array.isArray(data)
+              ? data
+              : omit(data, ["accessToken", "refreshToken"])
+          );
+          if (error.response) {
+            logger.error(
+              "Response error:",
+              error.response.status,
+              error.response.data
+            );
+
+            return Promise.reject(error as Error);
+          }
+
+          if (error.request) {
+            const errorData = error.toJSON();
+            logger.error("Request error:", errorData.code, errorData.message);
+            return Promise.reject(
+              new Error(
+                `Request failed with ${errorData.code} ${errorData.message}`
+              )
+            );
+          }
+
+          logger.error("Error", error.message);
+          return Promise.reject(error as Error);
+        }
+      );
+    }
+
+    const result = await db.getMany<string>([levelKeys.auth, levelKeys.user], {
+      valueEncoding: "json",
     });
+
+    const userAuth = result.at(0) as Auth | undefined;
+    const user = result.at(1) as User | undefined;
 
     this.userAuth = {
       authToken: userAuth?.accessToken ?? "",
       refreshToken: userAuth?.refreshToken ?? "",
       expirationTimestamp: userAuth?.tokenExpirationTimestamp ?? 0,
+      subscription: user?.subscription
+        ? { expiresAt: user.subscription?.expiresAt }
+        : null,
     };
+
+    const updatedUserData = await getUserData();
+
+    this.userAuth.subscription = updatedUserData?.subscription
+      ? {
+          expiresAt: updatedUserData.subscription.expiresAt,
+        }
+      : null;
   }
 
   private static sendSignOutEvent() {
-    if (WindowManager.mainWindow) {
-      WindowManager.mainWindow.webContents.send("on-signout");
-    }
+    WindowManager.sendToAppWindows("on-signout");
   }
 
-  private static async revalidateAccessTokenIfExpired() {
-    const now = new Date();
+  public static async refreshToken() {
+    const response = await this.instance.post(`/auth/refresh`, {
+      refreshToken: this.userAuth.refreshToken,
+    });
 
-    if (this.userAuth.expirationTimestamp < now.getTime()) {
-      try {
-        const response = await this.instance.post(`/auth/refresh`, {
-          refreshToken: this.userAuth.refreshToken,
-        });
+    const { accessToken, expiresIn } = response.data;
 
-        const { accessToken, expiresIn } = response.data;
+    const tokenExpirationTimestamp =
+      Date.now() +
+      this.secondsToMilliseconds(expiresIn) -
+      this.EXPIRATION_OFFSET_IN_MS;
 
-        const tokenExpirationTimestamp =
-          now.getTime() +
-          this.secondsToMilliseconds(expiresIn) -
-          this.EXPIRATION_OFFSET_IN_MS;
+    this.userAuth.authToken = accessToken;
+    this.userAuth.expirationTimestamp = tokenExpirationTimestamp;
 
-        this.userAuth.authToken = accessToken;
-        this.userAuth.expirationTimestamp = tokenExpirationTimestamp;
+    logger.log(
+      "Token refreshed. New expiration:",
+      this.userAuth.expirationTimestamp
+    );
 
-        logger.log("Token refreshed", this.userAuth);
-
-        userAuthRepository.upsert(
+    await db
+      .get<string, Auth>(levelKeys.auth, { valueEncoding: "json" })
+      .then((auth) => {
+        return db.put<string, Auth>(
+          levelKeys.auth,
           {
-            id: 1,
+            ...auth,
             accessToken,
             tokenExpirationTimestamp,
           },
-          ["id"]
+          { valueEncoding: "json" }
         );
+      });
+
+    return { accessToken, expiresIn };
+  }
+
+  private static async revalidateAccessTokenIfExpired() {
+    if (this.userAuth.expirationTimestamp < Date.now()) {
+      try {
+        await this.refreshToken();
       } catch (err) {
-        this.handleUnauthorizedError(err);
+        await this.handleUnauthorizedError(err);
       }
     }
   }
@@ -178,71 +307,210 @@ export class HydraApi {
     };
   }
 
-  private static handleUnauthorizedError = (err) => {
+  private static readonly handleUnauthorizedError = async (err) => {
     if (err instanceof AxiosError && err.response?.status === 401) {
-      logger.error("401 - Current credentials:", this.userAuth);
+      logger.error(
+        "401 - Current credentials:",
+        this.userAuth,
+        err.response?.data
+      );
 
       this.userAuth = {
         authToken: "",
         expirationTimestamp: 0,
         refreshToken: "",
+        subscription: null,
       };
 
-      userAuthRepository.delete({ id: 1 });
+      const { AchievementWatcherManager } = await import(
+        "./achievements/achievement-watcher-manager"
+      );
+      AchievementWatcherManager.resetSessionState();
 
+      db.batch([
+        {
+          type: "del",
+          key: levelKeys.auth,
+        },
+        {
+          type: "del",
+          key: levelKeys.user,
+        },
+      ]);
+
+      SSEClient.close();
       this.sendSignOutEvent();
     }
 
     throw err;
   };
 
-  static async get<T = any>(url: string, params?: any) {
-    if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+  private static async validateOptions(options?: HydraApiOptions) {
+    const needsAuth = options?.needsAuth == undefined || options.needsAuth;
+    const needsSubscription = options?.needsSubscription === true;
 
-    await this.revalidateAccessTokenIfExpired();
+    if (needsAuth) {
+      if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+      await this.revalidateAccessTokenIfExpired();
+    }
+
+    if (needsSubscription && !this.hasActiveSubscription()) {
+      throw new SubscriptionRequiredError();
+    }
+  }
+
+  static async get<T = any>(
+    url: string,
+    params?: any,
+    options?: HydraApiOptions
+  ) {
+    await this.validateOptions(options);
+
+    const headers = {
+      ...this.getAxiosConfig().headers,
+      "Hydra-If-Modified-Since": options?.ifModifiedSince?.toUTCString(),
+      "If-None-Match": options?.ifNoneMatch,
+    };
+
     return this.instance
-      .get<T>(url, { params, ...this.getAxiosConfig() })
+      .get<T>(url, {
+        params,
+        ...this.getAxiosConfig(),
+        headers,
+        validateStatus: options?.validateStatus,
+        signal: options?.signal,
+      })
       .then((response) => response.data)
       .catch(this.handleUnauthorizedError);
   }
 
-  static async post<T = any>(url: string, data?: any) {
-    if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+  static async getResponse<T = any>(
+    url: string,
+    params?: any,
+    options?: HydraApiOptions
+  ) {
+    await this.validateOptions(options);
 
-    await this.revalidateAccessTokenIfExpired();
+    const headers = {
+      ...this.getAxiosConfig().headers,
+      "Hydra-If-Modified-Since": options?.ifModifiedSince?.toUTCString(),
+      "If-None-Match": options?.ifNoneMatch,
+    };
+
     return this.instance
-      .post<T>(url, data, this.getAxiosConfig())
+      .get<T>(url, {
+        params,
+        ...this.getAxiosConfig(),
+        headers,
+        validateStatus: options?.validateStatus,
+        signal: options?.signal,
+      })
+      .then((response) => ({
+        status: response.status,
+        data: response.data,
+        headers: response.headers,
+      }))
+      .catch(this.handleUnauthorizedError);
+  }
+
+  static async post<T = any>(
+    url: string,
+    data?: any,
+    options?: HydraApiOptions
+  ) {
+    await this.validateOptions(options);
+
+    return this.instance
+      .post<T>(url, data, {
+        ...this.getAxiosConfig(),
+        signal: options?.signal,
+      })
       .then((response) => response.data)
       .catch(this.handleUnauthorizedError);
   }
 
-  static async put<T = any>(url: string, data?: any) {
-    if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+  static async put<T = any>(
+    url: string,
+    data?: any,
+    options?: HydraApiOptions
+  ) {
+    await this.validateOptions(options);
 
-    await this.revalidateAccessTokenIfExpired();
     return this.instance
-      .put<T>(url, data, this.getAxiosConfig())
+      .put<T>(url, data, {
+        ...this.getAxiosConfig(),
+        signal: options?.signal,
+      })
       .then((response) => response.data)
       .catch(this.handleUnauthorizedError);
   }
 
-  static async patch<T = any>(url: string, data?: any) {
-    if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+  static async patch<T = any>(
+    url: string,
+    data?: any,
+    options?: HydraApiOptions
+  ) {
+    await this.validateOptions(options);
 
-    await this.revalidateAccessTokenIfExpired();
     return this.instance
-      .patch<T>(url, data, this.getAxiosConfig())
+      .patch<T>(url, data, {
+        ...this.getAxiosConfig(),
+        signal: options?.signal,
+      })
       .then((response) => response.data)
       .catch(this.handleUnauthorizedError);
   }
 
-  static async delete<T = any>(url: string) {
-    if (!this.isLoggedIn()) throw new UserNotLoggedInError();
+  static async delete<T = any>(url: string, options?: HydraApiOptions) {
+    await this.validateOptions(options);
 
-    await this.revalidateAccessTokenIfExpired();
     return this.instance
-      .delete<T>(url, this.getAxiosConfig())
+      .delete<T>(url, {
+        ...this.getAxiosConfig(),
+        signal: options?.signal,
+      })
       .then((response) => response.data)
       .catch(this.handleUnauthorizedError);
+  }
+
+  static async checkDownloadSourcesChanges(
+    downloadSourceIds: string[],
+    games: Array<{ shop: string; objectId: string }>,
+    since: string
+  ) {
+    logger.info("HydraApi.checkDownloadSourcesChanges called with:", {
+      downloadSourceIds,
+      gamesCount: games.length,
+      since,
+      isLoggedIn: this.isLoggedIn(),
+    });
+
+    try {
+      const result = await this.post<
+        Array<{
+          shop: string;
+          objectId: string;
+          newDownloadOptionsCount: number;
+          downloadSourceIds: string[];
+        }>
+      >(
+        "/download-sources/changes",
+        {
+          downloadSourceIds,
+          games,
+          since,
+        },
+        { needsAuth: true }
+      );
+
+      logger.info(
+        "HydraApi.checkDownloadSourcesChanges completed successfully:",
+        result
+      );
+      return result;
+    } catch (error) {
+      logger.error("HydraApi.checkDownloadSourcesChanges failed:", error);
+      throw error;
+    }
   }
 }

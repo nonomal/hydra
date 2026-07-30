@@ -1,20 +1,47 @@
-import type { Game, GameRepack, GameShop, ShopDetails } from "@types";
+import type {
+  GameRepack,
+  GameShop,
+  GameStats,
+  LibraryGame,
+  ShopDetailsWithAssets,
+  UserAchievement,
+} from "@types";
+
+export type GameOptionsCategoryId =
+  | "general"
+  | "locations"
+  | "assets"
+  | "hydra_cloud"
+  | "compatibility"
+  | "downloads"
+  | "danger_zone";
 
 export interface GameDetailsContext {
-  game: Game | null;
-  shopDetails: ShopDetails | null;
+  game: LibraryGame | null;
+  shopDetails: ShopDetailsWithAssets | null;
   repacks: GameRepack[];
   shop: GameShop;
   gameTitle: string;
   isGameRunning: boolean;
   isLoading: boolean;
-  objectID: string | undefined;
-  gameColor: string;
+  objectId: string | undefined;
   showRepacksModal: boolean;
   showGameOptionsModal: boolean;
-  setGameColor: React.Dispatch<React.SetStateAction<string>>;
+  gameOptionsInitialCategory: GameOptionsCategoryId;
+  stats: GameStats | null;
+  achievements: UserAchievement[] | null;
+  hasNSFWContentBlocked: boolean;
+  lastDownloadedOption: GameRepack | null;
+  isTransferring: boolean;
+  transferProgress: number;
   selectGameExecutable: () => Promise<string | null>;
   updateGame: () => Promise<void>;
+  refreshGameDetails: () => Promise<void>;
   setShowRepacksModal: React.Dispatch<React.SetStateAction<boolean>>;
   setShowGameOptionsModal: React.Dispatch<React.SetStateAction<boolean>>;
+  setGameOptionsInitialCategory: React.Dispatch<
+    React.SetStateAction<GameOptionsCategoryId>
+  >;
+  setHasNSFWContentBlocked: React.Dispatch<React.SetStateAction<boolean>>;
+  cancelTransfer: () => void;
 }

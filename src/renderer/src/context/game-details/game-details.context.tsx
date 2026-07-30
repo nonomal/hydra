@@ -1,14 +1,33 @@
-import { createContext, useCallback, useEffect, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { createContext, useCallback, useEffect, useRef, useState } from "react";
 
 import { setHeaderTitle } from "@renderer/features";
-import { getSteamLanguage } from "@renderer/helpers";
-import { useAppDispatch, useAppSelector, useDownload } from "@renderer/hooks";
+import { levelDBService } from "@renderer/services/leveldb.service";
+import { ensureArray } from "@renderer/helpers";
+import { orderBy } from "lodash-es";
+import {
+  useAppDispatch,
+  useAppSelector,
+  useDownload,
+  useUserDetails,
+} from "@renderer/hooks";
 
-import type { Game, GameRepack, GameShop, ShopDetails } from "@types";
+import type {
+  DownloadSource,
+  GameRepack,
+  GameShop,
+  GameStats,
+  LibraryGame,
+  ShopDetailsWithAssets,
+  UserAchievement,
+} from "@types";
 
 import { useTranslation } from "react-i18next";
-import { GameDetailsContext } from "./game-details.context.types";
+import { useLocation } from "react-router-dom";
+import {
+  GameDetailsContext,
+  GameOptionsCategoryId,
+} from "./game-details.context.types";
+import { getGameExecutableFilters, SteamContentDescriptor } from "@shared";
 
 export const gameDetailsContext = createContext<GameDetailsContext>({
   game: null,
@@ -18,15 +37,24 @@ export const gameDetailsContext = createContext<GameDetailsContext>({
   gameTitle: "",
   isGameRunning: false,
   isLoading: false,
-  objectID: undefined,
-  gameColor: "",
+  objectId: undefined,
   showRepacksModal: false,
   showGameOptionsModal: false,
-  setGameColor: () => {},
+  gameOptionsInitialCategory: "general",
+  stats: null,
+  achievements: null,
+  hasNSFWContentBlocked: false,
+  lastDownloadedOption: null,
+  isTransferring: false,
+  transferProgress: 0,
   selectGameExecutable: async () => null,
   updateGame: async () => {},
+  refreshGameDetails: async () => {},
   setShowGameOptionsModal: () => {},
+  setGameOptionsInitialCategory: () => {},
   setShowRepacksModal: () => {},
+  setHasNSFWContentBlocked: () => {},
+  cancelTransfer: () => {},
 });
 
 const { Provider } = gameDetailsContext;
@@ -34,32 +62,46 @@ export const { Consumer: GameDetailsContextConsumer } = gameDetailsContext;
 
 export interface GameDetailsContextProps {
   children: React.ReactNode;
+  objectId: string;
+  gameTitle: string;
+  shop: GameShop;
 }
 
 export function GameDetailsContextProvider({
   children,
-}: GameDetailsContextProps) {
-  const { objectID, shop } = useParams();
+  objectId,
+  gameTitle,
+  shop,
+}: Readonly<GameDetailsContextProps>) {
+  const [shopDetails, setShopDetails] = useState<ShopDetailsWithAssets | null>(
+    null
+  );
+  const [achievements, setAchievements] = useState<UserAchievement[] | null>(
+    null
+  );
+  const [game, setGame] = useState<LibraryGame | null>(null);
+  const [hasNSFWContentBlocked, setHasNSFWContentBlocked] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [transferProgress, setTransferProgress] = useState(0);
 
-  const [shopDetails, setGameDetails] = useState<ShopDetails | null>(null);
-  const [repacks, setRepacks] = useState<GameRepack[]>([]);
-  const [game, setGame] = useState<Game | null>(null);
+  const [stats, setStats] = useState<GameStats | null>(null);
 
-  const [isLoading, setIsLoading] = useState(false);
-  const [gameColor, setGameColor] = useState("");
-  const [isGameRunning, setisGameRunning] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isGameRunning, setIsGameRunning] = useState(false);
   const [showRepacksModal, setShowRepacksModal] = useState(false);
   const [showGameOptionsModal, setShowGameOptionsModal] = useState(false);
+  const [gameOptionsInitialCategory, setGameOptionsInitialCategory] =
+    useState<GameOptionsCategoryId>("general");
+  const [repacks, setRepacks] = useState<GameRepack[]>([]);
 
-  const [searchParams] = useSearchParams();
-
-  const gameTitle = searchParams.get("title")!;
-
-  const { i18n } = useTranslation("game_details");
+  const { t, i18n } = useTranslation("game_details");
+  const location = useLocation();
 
   const dispatch = useAppDispatch();
 
   const { lastPacket } = useDownload();
+  const { userDetails } = useUserDetails();
 
   const userPreferences = useAppSelector(
     (state) => state.userPreferences.value
@@ -67,46 +109,197 @@ export function GameDetailsContextProvider({
 
   const updateGame = useCallback(async () => {
     return window.electron
-      .getGameByObjectID(objectID!)
+      .getGameByObjectId(shop, objectId)
       .then((result) => setGame(result));
-  }, [setGame, objectID]);
+  }, [shop, objectId]);
 
-  const isGameDownloading = lastPacket?.game.id === game?.id;
+  const fetchGameDetails = useCallback(async () => {
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
-  useEffect(() => {
-    updateGame();
-  }, [updateGame, isGameDownloading, lastPacket?.game.status]);
+    const shopDetailsPromise = window.electron
+      .getGameShopDetails(objectId, shop, i18n.language)
+      .then((result) => {
+        if (abortController.signal.aborted) return;
 
-  useEffect(() => {
-    Promise.allSettled([
-      window.electron.getGameShopDetails(
-        objectID!,
-        shop as GameShop,
-        getSteamLanguage(i18n.language)
-      ),
-      window.electron.searchGameRepacks(gameTitle),
-    ])
-      .then(([appDetailsResult, repacksResult]) => {
-        if (appDetailsResult.status === "fulfilled")
-          setGameDetails(appDetailsResult.value);
+        setShopDetails(result);
 
-        if (repacksResult.status === "fulfilled")
-          setRepacks(repacksResult.value);
-      })
-      .finally(() => {
-        setIsLoading(false);
+        if (
+          result?.content_descriptors.ids.includes(
+            SteamContentDescriptor.AdultOnlySexualContent
+          ) &&
+          !userPreferences?.disableNsfwAlert
+        ) {
+          setHasNSFWContentBlocked(true);
+        }
+
+        if (result?.assets) {
+          setIsLoading(false);
+        }
+
+        if (userDetails && shop !== "custom") {
+          const useRetroAchievements =
+            shop === "launchbox" &&
+            Boolean(userPreferences?.retroAchievementsWebApiKey);
+
+          if (useRetroAchievements) {
+            globalThis.window.electron
+              .getRetroAchievementsAchievements(
+                objectId,
+                shop,
+                result?.retroAchievementsGameId ?? undefined
+              )
+              .then((achievements) => {
+                if (abortController.signal.aborted) return;
+                setAchievements(achievements ?? []);
+              })
+              .catch(() => {
+                if (!abortController.signal.aborted) setAchievements([]);
+              });
+          } else {
+            globalThis.window.electron
+              .getUnlockedAchievements(objectId, shop)
+              .then((achievements) => {
+                if (abortController.signal.aborted) return;
+                if (achievements) setAchievements(achievements);
+              })
+              .catch(() => void 0);
+          }
+        }
       });
 
-    updateGame();
-  }, [updateGame, dispatch, gameTitle, objectID, shop, i18n.language]);
+    if (shop !== "custom") {
+      window.electron.getGameStats(objectId, shop).then((result) => {
+        if (abortController.signal.aborted) return;
+        setStats(result);
+      });
+    }
+
+    const assetsPromise = window.electron.getGameAssets(objectId, shop);
+
+    Promise.all([shopDetailsPromise, assetsPromise])
+      .then(([_, assets]) => {
+        if (assets) {
+          if (abortController.signal.aborted) return;
+          setShopDetails((prev) => {
+            if (!prev) return null;
+            return {
+              ...prev,
+              assets,
+            };
+          });
+        }
+      })
+      .finally(() => {
+        if (abortController.signal.aborted) return;
+        setIsLoading(false);
+      });
+  }, [
+    i18n.language,
+    objectId,
+    shop,
+    userDetails,
+    userPreferences?.disableNsfwAlert,
+    userPreferences?.retroAchievementsWebApiKey,
+  ]);
+
+  const refreshGameDetails = useCallback(async () => {
+    await Promise.all([updateGame(), fetchGameDetails()]);
+  }, [fetchGameDetails, updateGame]);
+
+  const isGameDownloading =
+    lastPacket?.gameId === game?.id && game?.download?.status === "active";
 
   useEffect(() => {
-    setGameDetails(null);
+    updateGame();
+  }, [updateGame, isGameDownloading, lastPacket?.gameId]);
+
+  // Listen for transfer events
+  useEffect(() => {
+    const onTransferProgress = (
+      _: unknown,
+      shop: string,
+      objectId: string,
+      progress: number
+    ) => {
+      if (shop === game?.shop && objectId === game?.objectId) {
+        setIsTransferring(progress >= 0 && progress < 1);
+        setTransferProgress(progress);
+      }
+    };
+
+    const onTransferComplete = (_: unknown, shop: string, objectId: string) => {
+      if (shop === game?.shop && objectId === game?.objectId) {
+        setIsTransferring(false);
+        setTransferProgress(0);
+        updateGame();
+      }
+    };
+
+    const onTransferCancelled = (
+      _: unknown,
+      shop: string,
+      objectId: string
+    ) => {
+      if (shop === game?.shop && objectId === game?.objectId) {
+        setIsTransferring(false);
+        setTransferProgress(0);
+      }
+    };
+
+    const onTransferError = (_: unknown, shop: string, objectId: string) => {
+      if (shop === game?.shop && objectId === game?.objectId) {
+        setIsTransferring(false);
+        setTransferProgress(0);
+      }
+    };
+
+    window.electron.on("on-game-transfer-progress", onTransferProgress);
+    window.electron.on("on-game-transfer-complete", onTransferComplete);
+    window.electron.on("on-game-transfer-cancelled", onTransferCancelled);
+    window.electron.on("on-game-transfer-error", onTransferError);
+
+    return () => {
+      window.electron.off("on-game-transfer-progress", onTransferProgress);
+      window.electron.off("on-game-transfer-complete", onTransferComplete);
+      window.electron.off("on-game-transfer-cancelled", onTransferCancelled);
+      window.electron.off("on-game-transfer-error", onTransferError);
+    };
+  }, [game]);
+
+  useEffect(() => {
+    fetchGameDetails().catch(() => {});
+  }, [fetchGameDetails]);
+
+  useEffect(() => {
+    setShopDetails(null);
     setGame(null);
     setIsLoading(true);
-    setisGameRunning(false);
+    setIsGameRunning(false);
+    setAchievements(null);
+    setGameOptionsInitialCategory("general");
     dispatch(setHeaderTitle(gameTitle));
-  }, [objectID, gameTitle, dispatch]);
+  }, [objectId, gameTitle, dispatch]);
+
+  useEffect(() => {
+    const state =
+      (location && (location.state as Record<string, unknown>)) || {};
+    if (state.openRepacks) {
+      setShowRepacksModal(true);
+      try {
+        window.history.replaceState({}, document.title, location.pathname);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }, [location]);
+
+  useEffect(() => {
+    if (game?.title) {
+      dispatch(setHeaderTitle(game.title));
+    }
+  }, [game?.title, dispatch]);
 
   useEffect(() => {
     const unsubscribe = window.electron.onGamesRunning((gamesIds) => {
@@ -118,12 +311,133 @@ export function GameDetailsContextProvider({
         updateGame();
       }
 
-      setisGameRunning(updatedIsGameRunning);
+      setIsGameRunning(updatedIsGameRunning);
     });
+
     return () => {
       unsubscribe();
     };
   }, [game?.id, isGameRunning, updateGame]);
+
+  useEffect(() => {
+    const unsubscribe = window.electron.onLibraryBatchComplete(() => {
+      refreshGameDetails().catch(() => {});
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [refreshGameDetails]);
+
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      try {
+        const detail = (ev as CustomEvent).detail || {};
+        if (detail.objectId && detail.objectId === objectId) {
+          setShowRepacksModal(true);
+        }
+      } catch (e) {
+        void e;
+      }
+    };
+
+    window.addEventListener("hydra:openRepacks", handler as EventListener);
+
+    return () => {
+      window.removeEventListener("hydra:openRepacks", handler as EventListener);
+    };
+  }, [objectId]);
+
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      try {
+        const detail = (ev as CustomEvent).detail || {};
+        if (detail.objectId && detail.objectId === objectId) {
+          setGameOptionsInitialCategory("general");
+          setShowGameOptionsModal(true);
+        }
+      } catch (e) {
+        void e;
+      }
+    };
+
+    window.addEventListener("hydra:openGameOptions", handler as EventListener);
+
+    return () => {
+      window.removeEventListener(
+        "hydra:openGameOptions",
+        handler as EventListener
+      );
+    };
+  }, [objectId]);
+
+  useEffect(() => {
+    const state =
+      (location && (location.state as Record<string, unknown>)) || {};
+    if (state.openGameOptions) {
+      setGameOptionsInitialCategory("general");
+      setShowGameOptionsModal(true);
+
+      try {
+        window.history.replaceState({}, document.title, location.pathname);
+      } catch (_e) {
+        void _e;
+      }
+    }
+  }, [location]);
+
+  useEffect(() => {
+    const unsubscribe = window.electron.onUpdateAchievements(
+      objectId,
+      shop,
+      (achievements) => {
+        if (!userDetails) return;
+        setAchievements(achievements);
+      }
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, [objectId, shop, userDetails]);
+
+  useEffect(() => {
+    if (shop === "custom") return;
+
+    const fetchDownloadSources = async () => {
+      try {
+        const sourcesRaw = (await levelDBService.values(
+          "downloadSources"
+        )) as DownloadSource[];
+        const sources = orderBy(sourcesRaw, "createdAt", "desc");
+
+        const params = {
+          take: 100,
+          skip: 0,
+          downloadSourceIds: sources.map((source) => source.id),
+        };
+
+        const downloads = await window.electron.hydraApi.get<GameRepack[]>(
+          `/games/${shop}/${objectId}/download-sources`,
+          {
+            params,
+            needsAuth: false,
+          }
+        );
+
+        setRepacks(
+          ensureArray<GameRepack>(
+            downloads,
+            `/games/${shop}/${objectId}/download-sources`
+          )
+        );
+      } catch (error) {
+        console.error("Failed to fetch download sources:", error);
+      }
+    };
+
+    fetchDownloadSources();
+  }, [shop, objectId]);
 
   const getDownloadsPath = async () => {
     if (userPreferences?.downloadsPath) return userPreferences.downloadsPath;
@@ -133,16 +447,19 @@ export function GameDetailsContextProvider({
   const selectGameExecutable = async () => {
     const downloadsPath = await getDownloadsPath();
 
+    const filters = getGameExecutableFilters(
+      globalThis.window.electron.platform,
+      {
+        executable: t("game_executable"),
+        allFiles: t("all_files"),
+      }
+    );
+
     return window.electron
       .showOpenDialog({
         properties: ["openFile"],
         defaultPath: downloadsPath,
-        filters: [
-          {
-            name: "Game executable",
-            extensions: ["exe", "lnk"],
-          },
-        ],
+        filters,
       })
       .then(({ filePaths }) => {
         if (filePaths && filePaths.length > 0) {
@@ -153,25 +470,41 @@ export function GameDetailsContextProvider({
       });
   };
 
+  // Handlers for cancel
+  const cancelTransfer = () => {
+    window.electron.cancelGameTransfer?.(shop, objectId);
+    setIsTransferring(false);
+    setTransferProgress(0);
+  };
+
   return (
     <Provider
       value={{
         game,
         shopDetails,
-        shop: shop as GameShop,
+        shop,
         repacks,
         gameTitle,
         isGameRunning,
         isLoading,
-        objectID,
-        gameColor,
+        objectId,
         showGameOptionsModal,
+        gameOptionsInitialCategory,
         showRepacksModal,
-        setGameColor,
+        stats,
+        achievements,
+        hasNSFWContentBlocked,
+        lastDownloadedOption: null,
+        isTransferring,
+        transferProgress,
+        setHasNSFWContentBlocked,
         selectGameExecutable,
         updateGame,
+        refreshGameDetails,
         setShowRepacksModal,
         setShowGameOptionsModal,
+        setGameOptionsInitialCategory,
+        cancelTransfer,
       }}
     >
       {children}

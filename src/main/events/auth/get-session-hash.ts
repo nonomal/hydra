@@ -1,16 +1,18 @@
 import jwt from "jsonwebtoken";
-import * as Sentry from "@sentry/electron/main";
 
-import { userAuthRepository } from "@main/repository";
 import { registerEvent } from "../register-event";
+import { db, levelKeys } from "@main/level";
+import type { Auth } from "@types";
 
 const getSessionHash = async (_event: Electron.IpcMainInvokeEvent) => {
-  const auth = await userAuthRepository.findOne({ where: { id: 1 } });
+  const auth = await db.get<string, Auth>(levelKeys.auth, {
+    valueEncoding: "json",
+  });
 
   if (!auth) return null;
   const payload = jwt.decode(auth.accessToken) as jwt.JwtPayload;
 
-  Sentry.setContext("sessionId", payload.sessionId);
+  if (!payload) return null;
 
   return payload.sessionId;
 };
